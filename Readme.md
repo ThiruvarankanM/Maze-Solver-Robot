@@ -25,22 +25,73 @@ The robot starts in **Section A (4×4)**, finds the bridge, follows a line acros
 ## Project Structure
 
 ```
-├── include/        # Header files (pin maps, config)
-├── lib/            # Modules: motors, sensors, maze, line follower
-├── src/            # main.cpp
-├── test/           # Unit tests
-├── docs/           # Wiring diagrams, design notes
-└── platformio.ini
+Maze-Solver-Robot/
+├── include/
+│   ├── pins.h                  # Every pin number
+│   └── config.h                # Speeds, thresholds, arena sizes
+├── lib/
+│   ├── Drive/                  # Motors, encoders, gyro
+│   ├── WallSensors/            # Ultrasonic sensors
+│   ├── LineSensor/             # IR array
+│   ├── LineFollower/           # PID line following
+│   ├── Maze/                   # Flood fill + shortest path
+│   ├── MazeStore/              # Save maze to EEPROM
+│   └── Navigator/              # Position, heading, cell moves
+├── src/
+│   └── main.cpp                # Run state machine
+├── test/
+│   └── test_maze/              # Flood fill tests (run on laptop)
+├── docs/
+│   └── Maze_Solver.pdf         # Project brief
+├── .github/
+│   ├── workflows/build.yml     # CI: build + tests on every PR
+│   └── pull_request_template.md
+└── platformio.ini              # Build environments
 ```
+
+### What goes where
+
+| Folder | Purpose | Rule |
+|---|---|---|
+| `include/` | Shared settings used by every module | All pin numbers go in `pins.h`, all tunable numbers in `config.h` — never hardcode them elsewhere |
+| `lib/` | One folder per module, each with its own `.h` and `.cpp` | A module does one job only |
+| `src/main.cpp` | Decides what the robot does next (`CALIBRATE → EXPLORE_A → CROSS_BRIDGE → EXPLORE_B → RETURN_TO_START → FAST_RUN → FINISHED`) | Calls modules, contains no low-level hardware code |
+| `test/` | Automatic tests that run on a laptop | Only for code without `Arduino.h` (e.g. `Maze`) |
+| `docs/` | Brief, wiring diagram, design notes, demo video links, commit-map screenshots | |
+| `.github/` | CI and templates | |
+
+### How the modules connect
+
+```
+                 main.cpp  (state machine)
+                     │
+      ┌──────────────┼──────────────┐
+  Navigator        Maze        LineFollower
+      │          MazeStore          │
+  ┌───┴─────┐                   LineSensor
+Drive  WallSensors
+```
+
+- **Top:** `main.cpp` picks the current stage and calls the modules for it.
+- **Middle:** `Navigator`, `Maze`, `MazeStore` and `LineFollower` make the decisions.
+- **Bottom:** `Drive`, `WallSensors` and `LineSensor` talk to the hardware. Only these touch pins.
+
+### Build environments
+
+| Environment | What it does |
+|---|---|
+| `mega` (default) | The full robot program |
+| `native` | Runs `test/` on your laptop |
 
 ## Getting Started
 
 1. Install [PlatformIO](https://platformio.org/) (in VS Code).
 2. Clone the repo:
    ```bash
-   git clone https://github.com/<your-username>/EE4360-Maze-Solver-Robot.git
+   git clone https://github.com/ThiruvarankanM/Maze-Solver-Robot.git
    ```
 3. Open the folder in PlatformIO, then **Build** and **Upload** to the Arduino Mega.
+4. Run the tests on your laptop: `pio test -e native`.
 
 ## Roadmap
 
@@ -62,5 +113,5 @@ The robot starts in **Section A (4×4)**, finds the bridge, follows a line acros
 
 ## Workflow
 
-- Work on feature branches (`feature/<name>`) and merge into `main` through pull requests.
+- Merge changes into `main` through pull requests.
 - Commit small changes often, with clear messages (e.g. `feat: add PID line follower`).
