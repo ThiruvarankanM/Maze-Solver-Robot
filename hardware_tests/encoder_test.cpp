@@ -23,6 +23,8 @@
  *   +/- -> change test speed by 20
  */
 
+#include <Arduino.h>
+
 // ---------------- Encoder pins ----------------
 const uint8_t L_ENC_A = 2;
 const uint8_t L_ENC_B = 3;

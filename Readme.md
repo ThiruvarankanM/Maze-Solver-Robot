@@ -39,6 +39,12 @@ Maze-Solver-Robot/
 │   └── Navigator/              # Position, heading, cell moves
 ├── src/
 │   └── main.cpp                # Run state machine
+├── hardware_tests/
+│   ├── motor_test.cpp
+│   ├── encoder_test.cpp
+│   ├── ultrasonic_test.cpp
+│   ├── ir_array_test.cpp
+│   └── gyro_test.cpp
 ├── test/
 │   └── test_maze/              # Flood fill tests (run on laptop)
 ├── docs/
@@ -56,6 +62,7 @@ Maze-Solver-Robot/
 | `include/` | Shared settings used by every module | All pin numbers go in `pins.h`, all tunable numbers in `config.h` — never hardcode them elsewhere |
 | `lib/` | One folder per module, each with its own `.h` and `.cpp` | A module does one job only |
 | `src/main.cpp` | Decides what the robot does next (`CALIBRATE → EXPLORE_A → CROSS_BRIDGE → EXPLORE_B → RETURN_TO_START → FAST_RUN → FINISHED`) | Calls modules, contains no low-level hardware code |
+| `hardware_tests/` | Small sketches to check one part on the real robot | One file per part, uploaded via its own environment |
 | `test/` | Automatic tests that run on a laptop | Only for code without `Arduino.h` (e.g. `Maze`) |
 | `docs/` | Brief, wiring diagram, design notes, demo video links, commit-map screenshots | |
 | `.github/` | CI and templates | |
@@ -82,6 +89,7 @@ Drive  WallSensors
 |---|---|
 | `mega` (default) | The full robot program |
 | `native` | Runs `test/` on your laptop |
+| `motor_test`, `encoder_test`, `ultrasonic_test`, `ir_array_test`, `gyro_test` | Uploads one hardware test sketch |
 
 ## Getting Started
 
@@ -92,6 +100,7 @@ Drive  WallSensors
    ```
 3. Open the folder in PlatformIO, then **Build** and **Upload** to the Arduino Mega.
 4. Run the tests on your laptop: `pio test -e native`.
+5. To check one part on the robot, pick its environment (e.g. `motor_test`) in the PlatformIO bottom bar and **Upload**.
 
 ## Roadmap
 

@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <Wire.h>
 
 #define MPU6050_ADDR 0x68
