@@ -5,6 +5,16 @@ static const int8_t DY[4] = {1, 0, -1, 0};
 
 static Dir opposite(Dir d) { return static_cast<Dir>((d + 2) % 4); }
 
+// 0 = carry straight on, 1 = a 90 degree turn, 2 = turn right around.
+static uint8_t turnCost(Dir from, Dir to)
+{
+    uint8_t diff = static_cast<uint8_t>((to + 4 - from) % 4);
+    if (diff == 0) {
+        return 0;
+    }
+    return (diff == 2) ? 2 : 1;
+}
+
 Maze::Maze(uint8_t size) : size_(size > MAX_SIZE ? MAX_SIZE : size) { clear(); }
 
 void Maze::clear()
@@ -16,6 +26,8 @@ void Maze::clear()
         }
     }
 }
+
+bool Maze::inBounds(uint8_t x, uint8_t y) const { return x < size_ && y < size_; }
 
 bool Maze::neighbour(uint8_t x, uint8_t y, Dir d, uint8_t &nx, uint8_t &ny) const
 {
@@ -31,15 +43,33 @@ bool Maze::neighbour(uint8_t x, uint8_t y, Dir d, uint8_t &nx, uint8_t &ny) cons
 
 void Maze::setWall(uint8_t x, uint8_t y, Dir d)
 {
-    walls_[x][y] |= 1 << d;
+    if (!inBounds(x, y)) {
+        return;
+    }
+    walls_[x][y] |= static_cast<uint8_t>(1 << d);
     uint8_t nx, ny;
     if (neighbour(x, y, d, nx, ny)) {
-        walls_[nx][ny] |= 1 << opposite(d);
+        walls_[nx][ny] |= static_cast<uint8_t>(1 << opposite(d));
+    }
+}
+
+void Maze::clearWall(uint8_t x, uint8_t y, Dir d)
+{
+    if (!inBounds(x, y)) {
+        return;
+    }
+    walls_[x][y] &= static_cast<uint8_t>(~(1 << d));
+    uint8_t nx, ny;
+    if (neighbour(x, y, d, nx, ny)) {
+        walls_[nx][ny] &= static_cast<uint8_t>(~(1 << opposite(d)));
     }
 }
 
 bool Maze::hasWall(uint8_t x, uint8_t y, Dir d) const
 {
+    if (!inBounds(x, y)) {
+        return true;
+    }
     uint8_t nx, ny;
     return (walls_[x][y] & (1 << d)) || !neighbour(x, y, d, nx, ny);
 }
@@ -50,6 +80,10 @@ void Maze::floodFill(uint8_t goalX, uint8_t goalY)
         for (uint8_t y = 0; y < size_; y++) {
             dist_[x][y] = UNREACHABLE;
         }
+    }
+
+    if (!inBounds(goalX, goalY)) {
+        return;
     }
 
     // BFS outward from the goal; each cell gets its step count
@@ -75,7 +109,13 @@ void Maze::floodFill(uint8_t goalX, uint8_t goalY)
     }
 }
 
-uint8_t Maze::distance(uint8_t x, uint8_t y) const { return dist_[x][y]; }
+uint8_t Maze::distance(uint8_t x, uint8_t y) const
+{
+    if (!inBounds(x, y)) {
+        return UNREACHABLE;
+    }
+    return dist_[x][y];
+}
 
 Dir Maze::bestDirection(uint8_t x, uint8_t y) const
 {
@@ -92,4 +132,39 @@ Dir Maze::bestDirection(uint8_t x, uint8_t y) const
         }
     }
     return best;
+}
+
+bool Maze::bestDirection(uint8_t x, uint8_t y, Dir heading, Dir &out) const
+{
+    if (!inBounds(x, y)) {
+        return false;
+    }
+    const uint8_t here = dist_[x][y];
+    if (here == UNREACHABLE || here == 0) {
+        return false; // nowhere to go, or already standing on the goal
+    }
+
+    bool found = false;
+    uint8_t bestDist = UNREACHABLE;
+    uint8_t bestTurn = 255;
+
+    for (uint8_t d = 0; d < 4; d++) {
+        const Dir dir = static_cast<Dir>(d);
+        uint8_t nx, ny;
+        if (hasWall(x, y, dir) || !neighbour(x, y, dir, nx, ny)) {
+            continue;
+        }
+        const uint8_t nd = dist_[nx][ny];
+        if (nd >= here) {
+            continue; // must get strictly closer, so we can never loop forever
+        }
+        const uint8_t t = turnCost(heading, dir);
+        if (!found || nd < bestDist || (nd == bestDist && t < bestTurn)) {
+            found = true;
+            bestDist = nd;
+            bestTurn = t;
+            out = dir;
+        }
+    }
+    return found;
 }
