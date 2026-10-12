@@ -2,6 +2,8 @@
 
 #include "config.h"
 #include "pins.h"
+#include "Maze.h"
+#include "Navigator.h"
 
 enum class State {
     CALIBRATE,
