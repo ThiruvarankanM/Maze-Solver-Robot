@@ -37,16 +37,10 @@ public:
     void floodFill(uint8_t goalX, uint8_t goalY);
     uint8_t distance(uint8_t x, uint8_t y) const;
 
-    // Legacy chooser. Kept so existing callers and tests keep working, but it
-    // cannot report failure: when the goal is unreachable it returns NORTH
-    // even if a wall is there. Prefer the four-argument version below.
-    Dir bestDirection(uint8_t x, uint8_t y) const;
-
-    // Picks the neighbouring cell that is strictly closer to the goal, breaking
-    // ties in favour of driving straight on (fewer turns = faster run).
-    // Returns false - and leaves 'out' alone - when there is no such cell,
-    // i.e. the goal is unreachable, the robot is already on it, or (x, y) is
-    // out of range. Call floodFill() first.
+    // Picks the neighbouring cell strictly closer to the goal, breaking ties in
+    // favour of driving straight on. Returns false - leaving 'out' alone - when
+    // there is no such cell: the goal is unreachable, the robot is already on
+    // it, or (x, y) is out of range. Call floodFill() first.
     bool bestDirection(uint8_t x, uint8_t y, Dir heading, Dir &out) const;
 
     uint8_t size() const { return size_; }

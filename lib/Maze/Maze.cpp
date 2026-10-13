@@ -117,23 +117,6 @@ uint8_t Maze::distance(uint8_t x, uint8_t y) const
     return dist_[x][y];
 }
 
-Dir Maze::bestDirection(uint8_t x, uint8_t y) const
-{
-    Dir best = NORTH;
-    uint8_t bestDist = UNREACHABLE;
-    for (uint8_t d = 0; d < 4; d++) {
-        uint8_t nx, ny;
-        if (hasWall(x, y, static_cast<Dir>(d)) || !neighbour(x, y, static_cast<Dir>(d), nx, ny)) {
-            continue;
-        }
-        if (dist_[nx][ny] < bestDist) {
-            bestDist = dist_[nx][ny];
-            best = static_cast<Dir>(d);
-        }
-    }
-    return best;
-}
-
 bool Maze::bestDirection(uint8_t x, uint8_t y, Dir heading, Dir &out) const
 {
     if (!inBounds(x, y)) {
