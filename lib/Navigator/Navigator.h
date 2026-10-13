@@ -18,6 +18,11 @@ public:
         Unreachable, // no route to the goal exists on the current map
         Blocked,     // no legal move gets closer (safety net, should not happen)
         InvalidGoal, // the goal, or the robot's own pose, is outside the maze
+        // Neither of these moved the robot, and they ask for different things:
+        // Turned means TURN THE ROBOT, NeedsSensing means READ THE SENSORS.
+        // New results go at the end so the ones above keep their values.
+        Turned,       // now facing 'chosen'; re-sense, then call step() again
+        NeedsSensing, // no fresh reading for this pose; recordWalls() first
     };
 
     // 'map' is the robot's BELIEF about the walls, not the real maze. The
@@ -38,7 +43,14 @@ public:
     void recordWalls(bool left, bool front, bool right);
 
     // Runs flood fill towards the goal, picks a direction and moves one cell.
-    // 'chosen' is only written when the result is Moved.
+    // 'chosen' is written for Moved and Turned only.
+    //
+    // The sensors miss the cell behind the robot, which an empty map reads as
+    // open, so this never moves that way on trust: it returns Turned to have
+    // the robot face it and be re-sensed first. Once recordWalls() has been
+    // called at all, it also refuses to move on readings belonging to an older
+    // pose, returning NeedsSensing. Callers driving from a fully known map
+    // never sense, and are unaffected.
     Result step(uint8_t goalX, uint8_t goalY, Dir &chosen);
 
     static Dir leftOf(Dir d) { return static_cast<Dir>((d + 3) % 4); }
@@ -51,4 +63,15 @@ private:
     uint8_t y_;
     Dir heading_;
     uint16_t moves_;
+
+    // Where the robot was pointing when recordWalls() last ran for the cell it
+    // is in: the one direction those readings never cover is
+    // behind(sensedHeading_).
+    bool sensedValid_;
+    Dir sensedHeading_;
+
+    // Set by the first recordWalls() and never cleared. It marks a caller that
+    // drives from its sensors, which must confirm a direction before moving
+    // there; it stays false for known-map callers, which changes nothing.
+    bool everSensed_;
 };
