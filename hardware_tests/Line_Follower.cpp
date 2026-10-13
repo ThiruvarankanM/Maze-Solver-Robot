@@ -23,6 +23,7 @@
 //    P0.03  D0.3  I0  V80  X150  -> set Kp, Kd, Ki, base speed, max speed
 //  BUTTON: press = start / stop
 // ===================================================================
+#include <Arduino.h>
 #include "pins.h"
 
 // ---------------- IR ARRAY ----------------
