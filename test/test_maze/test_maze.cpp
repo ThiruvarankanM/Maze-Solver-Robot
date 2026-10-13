@@ -38,7 +38,10 @@ void test_wall_forces_detour()
     maze.setWall(0, 0, NORTH);
     maze.floodFill(0, 1);
     TEST_ASSERT_EQUAL_UINT8(3, maze.distance(0, 0));
-    TEST_ASSERT_EQUAL(EAST, maze.bestDirection(0, 0));
+
+    Dir out = SOUTH;
+    TEST_ASSERT_TRUE(maze.bestDirection(0, 0, NORTH, out));
+    TEST_ASSERT_EQUAL(EAST, out);
 }
 
 // ===================================================================
@@ -125,9 +128,9 @@ void test_clearing_a_wall_restores_the_short_route()
 
 // ===================================================================
 // New: the safe direction chooser
-// REGRESSION TESTS for the confirmed direction-selection bug.
-// The old one-result bestDirection(x, y) cannot report failure, so when the
-// goal is unreachable it hands back NORTH even when a wall is there.
+// REGRESSION TESTS for the confirmed direction-selection bug. The old
+// one-result bestDirection(x, y) could not report failure - it handed back
+// NORTH even when a wall was there - and has now been removed.
 // ===================================================================
 
 void test_safe_direction_fails_when_the_goal_is_unreachable()
@@ -194,7 +197,7 @@ void test_safe_direction_turns_when_straight_on_is_not_closer()
 
     Dir out = SOUTH;
     TEST_ASSERT_TRUE(maze.bestDirection(0, 0, NORTH, out));
-    TEST_ASSERT_EQUAL(EAST, out); // same answer as the legacy chooser
+    TEST_ASSERT_EQUAL(EAST, out);
 }
 
 void test_safe_direction_always_gets_strictly_closer()
