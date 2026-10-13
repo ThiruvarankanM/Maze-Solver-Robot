@@ -29,6 +29,7 @@
 
   Serial Monitor: 115200 baud. Type 'r' to reset min/max.
 */
+#include <Arduino.h>
 
 #define USE_ANALOG      1   // 1 = analog outputs, 0 = digital outputs
 #define USE_EMITTER_PIN 0   // 0 = emitters powered from 5V (always ON)
