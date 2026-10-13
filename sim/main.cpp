@@ -299,6 +299,7 @@ int main(int argc, char **argv)
     bool running = opt.autoRun;
     int steps = 0;
     const char *verdict = nullptr;
+    char illegalMove[128]; // holds the verdict text if a move crosses a real wall
     std::string lastDecision = "(not moved yet)";
 
     while (true) {
@@ -365,14 +366,44 @@ int main(int argc, char **argv)
             break;
         }
 
+        const uint8_t prevX = nav.x();
+        const uint8_t prevY = nav.y();
         Dir chosen = NORTH;
         const Navigator::Result res = nav.step(goalX, goalY, chosen);
         steps++;
+
+        // The robot decides using its BELIEF about the walls. Check the result
+        // against the REAL maze: without this, a move straight through a solid
+        // wall is indistinguishable from a legal one and still counts towards
+        // SUCCESS. This is the same check the unit tests make on every move.
+        if (res == Navigator::Result::Moved &&
+            (truth.hasWall(prevX, prevY, chosen) || !truth.inBounds(nav.x(), nav.y()))) {
+            snprintf(illegalMove, sizeof(illegalMove),
+                     "FAILED: illegal move - went %s from (%u,%u) through a real wall",
+                     dirName(chosen), prevX, prevY);
+            verdict = illegalMove;
+            break;
+        }
 
         switch (res) {
         case Navigator::Result::Moved:
             lastDecision = std::string("move ") + dirName(chosen);
             path.push_back({nav.x(), nav.y()});
+            break;
+        case Navigator::Result::NeedsSensing:
+            // Cannot happen while the loop above senses on every pass, so if it
+            // ever does the loop itself is wrong. Stop loudly rather than spin
+            // or let the run end up counted as a success.
+            verdict = "FAILED: the navigator wants a fresh sensor reading before it "
+                      "moves - recordWalls() was not called for the current pose";
+            break;
+        case Navigator::Result::Turned:
+            // Turned on the spot, nothing moved: not a move, so it is kept out
+            // of the path and out of moveCount(). The top of the loop re-reads
+            // the wall sensors, which is the whole point - the front sensor now
+            // looks at the cell the robot wants to enter.
+            lastDecision = std::string("turn to face ") + dirName(chosen) +
+                           " (re-checking the front sensor before moving)";
             break;
         case Navigator::Result::Arrived:
             verdict = "SUCCESS";
