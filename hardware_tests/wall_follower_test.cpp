@@ -289,6 +289,145 @@ Walls standingWalls(uint8_t rounds, float tb) {
   return votedWalls();
 }
 
+// ======================= GEOMETRY =======================
+float frontCornerRadius() { return sqrt(sq(AXLE_TO_FRONT_CM) + sq(ROBOT_WIDTH_CM / 2.0)); }
+float rearCornerRadius()  { return sqrt(sq(AXLE_TO_REAR_CM)  + sq(ROBOT_WIDTH_CM / 2.0)); }
+// How far past the cell edge the axle must go before the side sensors see that cell
+float decisionOffset()    { float o = SIDE_LOOK_MIN_CM + 2.0 - SIDE_SENSOR_AHEAD_CM; return (o > 0) ? o : 0; }
+float arcRadius()         { return min(ARC_RADIUS_CM, HALF_CELL - decisionOffset()); }
+float arcFrontTarget(float R) { return HALF_CELL + R - SENSOR_AHEAD_CM - WALL_HALF_CM; }
+float frontStopCm()       { return arcFrontTarget(arcRadius()) + FRONT_STOP_MARGIN_CM; }
+// Where the axle stops inside a cell (from its dead-end side) while reversing: sensors see it, rear stays clear
+float reverseStop()       { return min(SIDE_SENSOR_AHEAD_CM + REV_LOOK_CM, CELL_CM - AXLE_TO_REAR_CM - WALL_HALF_CM - 1.0); }
+float reverseOutRadius()  { return max(reverseStop() - HALF_CELL, 0.0); }
+
+void geometryReport() {
+  float hw = ROBOT_WIDTH_CM / 2.0;
+  float R = arcRadius();
+  float outerCorner = sqrt(sq(R + hw) + sq(AXLE_TO_FRONT_CM));
+  float outerClear  = (HALF_CELL + R) - outerCorner - WALL_HALF_CM;
+  float innerClear  = (R - hw) - sqrt(2.0) * (HALF_CELL - R) - WALL_HALF_CM;
+  float spinClear   = HALF_CELL - WALL_HALF_CM - max(frontCornerRadius(), rearCornerRadius());
+  float ratio       = (R - TRACK_CM / 2.0) / (R + TRACK_CM / 2.0);
+
+  Serial.println(F("\n--- Turn geometry (25 cm cell) ---"));
+  Serial.print(F("Decision point: axle ")); Serial.print(decisionOffset(), 1);
+  Serial.println(F(" cm past the cell edge (side sensors must see the new cell)"));
+  Serial.print(F("Arc radius ")); Serial.print(R, 1);
+  Serial.print(F(" cm -> inner wheel at ")); Serial.print(ratio * 100.0, 0);
+  Serial.println(F("% of outer wheel"));
+  Serial.print(F("Arc: outer corner clearance to far wall = ")); Serial.print(outerClear, 1);
+  Serial.println(outerClear > 0 ? F(" cm  OK") : F(" cm  WARNING: will clip the far wall"));
+  Serial.print(F("Arc: inner clearance to wall corner     = ")); Serial.print(innerClear, 1);
+  Serial.println(innerClear > 0 ? F(" cm  OK") : F(" cm  WARNING: will clip the inner corner"));
+  Serial.print(F("Spin: corner clearance to side walls    = ")); Serial.print(spinClear, 1);
+  Serial.println(spinClear > 0 ? F(" cm  OK") : F(" cm  WARNING: in-place spins (start/recovery) will scrape"));
+  Serial.print(F("Dead end: reverse out, then turn with radius ")); Serial.print(reverseOutRadius(), 1);
+  Serial.println(F(" cm"));
+}
+
+// ======================= MOTION PRIMITIVES =======================
+// Heading depends only on (left - right) wheel travel. After a move, nudge the follower wheel
+// until that gap matches the plan, so lag or coasting can't leave the robot angled.
+void fixWheelGap(long gapTarget, bool leadLeft) {
+  long tol = lround(GAP_TOL_CM * COUNTS_PER_CM);
+  unsigned long t0 = millis();
+  while (!abortReq && millis() - t0 < GAP_FIX_MS) {
+    checkAbort();
+    long l, r; getCounts(l, r);
+    long need = (l - r) - gapTarget;     // follower=right: move it +need; follower=left: move it -need
+    if (!leadLeft) need = -need;
+    if (labs(need) <= tol) break;
+    int p = (need > 0) ? GAP_FIX_PWM : -GAP_FIX_PWM;
+    if (leadLeft) setMotors(0, p); else setMotors(p, 0);
+  }
+  stopMotors();
+  delay(60);
+}
+
+// Moves each wheel a signed distance (cm) with soft start/stop.
+// The wheel with the shorter path is locked to the longer one by the encoders.
+bool wheelMove(float dL, float dR, int pwm, unsigned long timeoutMs) {
+  long tL = lround(dL * COUNTS_PER_CM), tR = lround(dR * COUNTS_PER_CM);
+  bool leadLeft = labs(tL) >= labs(tR);
+  long tLead = leadLeft ? tL : tR;
+  long tFol  = leadLeft ? tR : tL;
+  if (tLead == 0) return true;
+  float ratio = (float)tFol / tLead;
+  int sLead = (tLead > 0) ? 1 : -1;
+  long target = labs(tLead);
+  long slow = max(target / 4, (long)(3 * COUNTS_PER_CM));
+
+  resetCounts();
+  unsigned long t0 = millis(), progMs = t0;
+  long progLead = 0;
+  bool done = false;
+  while (!abortReq) {
+    checkAbort();
+    long l, r; getCounts(l, r);
+    long lead = (leadLeft ? l : r) * sLead;
+    long fol  = (leadLeft ? r : l) * sLead;
+    if (lead >= target) { done = true; break; }
+    unsigned long el = millis() - t0;
+    if (el > timeoutMs) break;
+    // wheels stuck against a wall: give up instead of pushing until the timeout
+    if (lead - progLead > STALL_MIN_CM * COUNTS_PER_CM) { progLead = lead; progMs = millis(); }
+    else if (millis() - progMs > STALL_MS) { Serial.println(F("[MOVE] stuck -> stop")); break; }
+
+    int sp = pwm;
+    if (el < RAMP_MS) sp = DEADBAND_PWM + (int)((pwm - DEADBAND_PWM) * (float)el / RAMP_MS);
+    long left = target - lead;
+    if (left < slow) sp = min(sp, DEADBAND_PWM + 10 + (int)((pwm - DEADBAND_PWM - 10) * (float)left / slow));
+
+    float err = ratio * lead - fol;
+    float ff  = (fabs(ratio) > 0.05) ? (DEADBAND_PWM + (sp - DEADBAND_PWM) * fabs(ratio)) * (ratio > 0 ? 1 : -1) : 0;
+    int fp = constrain((int)(ff + K_SYNC * err), -200, 200);
+    int lp = max(sp - constrain((int)(0.5 * K_SYNC * fabs(err)), 0, 25), DEADBAND_PWM + 5);
+
+    if (leadLeft) setMotors(sLead * lp, sLead * fp);
+    else          setMotors(sLead * fp, sLead * lp);
+  }
+  stopMotors();
+  delay(100);
+  if (done) fixWheelGap(tL - tR, leadLeft);
+  return done;
+}
+
+void driveCm(float cm) { wheelMove(cm, cm, BASE_PWM, 4000); }
+
+// dir = -1 left, +1 right
+void arcTurn(int dir, float R) {
+  float outer = (R + TRACK_CM / 2.0) * M_PI / 2.0 * ARC_TRIM;
+  float inner = (R - TRACK_CM / 2.0) * M_PI / 2.0 * ARC_TRIM;
+  if (dir < 0) wheelMove(inner, outer, ARC_PWM, 5000);
+  else         wheelMove(outer, inner, ARC_PWM, 5000);
+}
+
+// deg > 0 = right (clockwise)
+void spinDeg(float deg) {
+  float d = M_PI * TRACK_CM * fabs(deg) / 360.0 * SPIN_TRIM;
+  if (deg > 0) wheelMove(d, -d, SPIN_PWM, 5000);
+  else         wheelMove(-d, d, SPIN_PWM, 5000);
+}
+
+// Move forward/back until the front sensor reads targetCm. Gives up if the wall echo is lost.
+void approachFront(float targetCm) {
+  unsigned long t0 = millis();
+  uint8_t ok = 0, lost = 0;
+  while (!abortReq && millis() - t0 < 3000) {
+    checkAbort();
+    float err = pingNow(S_F) - targetCm;
+    if (err > 15.0) { stopMotors(); if (++lost >= 3) break; continue; }
+    lost = 0;
+    if (fabs(err) < 0.8) { stopMotors(); if (++ok >= 3) break; continue; }
+    ok = 0;
+    int sp = constrain((int)(DEADBAND_PWM + 4.0 * fabs(err)), DEADBAND_PWM + 5, 60);
+    if (err > 0) setMotors(sp, sp); else setMotors(-sp, -sp);
+  }
+  stopMotors();
+  delay(100);
+}
+
 // ======================= SETUP / LOOP =======================
 void setup() {
   Serial.begin(115200);
@@ -311,6 +450,7 @@ void setup() {
   pinMode(START_BTN, INPUT_PULLUP);
 
   COUNTS_PER_CM = (ENC_PPR * 4.0 * GEAR_RATIO) / (M_PI * WHEEL_DIA_CM);
+  if (ARC_RADIUS_CM > HALF_CELL) ARC_RADIUS_CM = HALF_CELL;
   resetFilters();
 
   EEPROM.get(CAL_ADDR, cal);
@@ -323,6 +463,7 @@ void setup() {
   if (sp.magic == SP_MAGIC) { L_SET = sp.lSet; R_SET = sp.rSet; }
 
   Serial.println(F("\n=== Maze Wall-Follower v3 ==="));
+  geometryReport();
 }
 
 void loop() {
@@ -333,6 +474,11 @@ void loop() {
     case 'x': stopMotors(); Serial.println(F("STOPPED")); break;
     case 'e': { long l, r; getCounts(l, r);
                 Serial.print(F("L=")); Serial.print(l); Serial.print(F(" R=")); Serial.println(r); } break;
+    case 'G': geometryReport(); break;
+    case 'F': Serial.println(F("Drive 1 cell")); driveCm(CELL_CM); break;
+    case '<': Serial.println(F("Arc left 90"));  arcTurn(-1, arcRadius()); break;
+    case '>': Serial.println(F("Arc right 90")); arcTurn(1, arcRadius());  break;
+    case 'U': Serial.println(F("Spin 180"));     spinDeg(180); break;
     default: break;
   }
 }
