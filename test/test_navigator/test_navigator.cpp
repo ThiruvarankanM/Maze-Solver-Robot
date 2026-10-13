@@ -46,6 +46,17 @@ static Navigator::Result drive(const Maze &truth, Navigator &nav, uint8_t gx, ui
         Dir chosen = NORTH;
         const Navigator::Result r = nav.step(gx, gy, chosen);
 
+        if (r == Navigator::Result::Turned) {
+            // Turned on the spot to face a direction the sensors had not
+            // covered. Nothing moved, so go round again - the loop above takes
+            // the fresh reading that makes the next decision safe.
+            TEST_ASSERT_EQUAL_UINT8(px, nav.x());
+            TEST_ASSERT_EQUAL_UINT8(py, nav.y());
+            TEST_ASSERT_EQUAL(chosen, nav.heading());
+            steps++;
+            continue;
+        }
+
         if (r != Navigator::Result::Moved) {
             return r;
         }
@@ -264,6 +275,151 @@ void test_exploring_a_sealed_goal_still_terminates()
     TEST_ASSERT_TRUE(nav.x() != 3 || nav.y() != 3); // it never got there
 }
 
+// ------------------------------------------------------------------
+// a wall behind the robot
+// ------------------------------------------------------------------
+
+// REGRESSION: the robot senses left/front/right only, so a wall BEHIND it is
+// unknown and an empty map reads it as open. It used to reverse straight
+// through that wall. Now it must turn to face the direction, re-read the front
+// sensor, discover the wall and go round.
+void test_never_moves_backwards_through_an_unsensed_wall()
+{
+    Maze truth(3);
+    truth.setWall(1, 1, WEST); // directly behind a robot that faces EAST
+    Maze belief(3);            // exploring: knows only the outer boundary
+    Navigator nav(belief, 1, 1, EAST);
+
+    // drive() asserts on every move that no wall of the REAL maze was crossed.
+    int steps = 0;
+    TEST_ASSERT_EQUAL(Navigator::Result::Arrived, drive(truth, nav, 0, 1, steps, true));
+    TEST_ASSERT_EQUAL_UINT8(0, nav.x());
+    TEST_ASSERT_EQUAL_UINT8(1, nav.y());
+
+    // Round the top - (1,1) -> (1,2) -> (0,2) -> (0,1) - not through the wall,
+    // which would have been a single move.
+    TEST_ASSERT_EQUAL_UINT16(3, nav.moveCount());
+    TEST_ASSERT_TRUE(belief.hasWall(1, 1, WEST)); // it learned the wall by turning
+}
+
+// A selected direction is NOT a performed move: the turn must be reported on
+// its own, and must leave the robot in the same cell.
+void test_turning_to_check_a_wall_is_not_a_move()
+{
+    Maze truth(3);
+    truth.setWall(1, 1, WEST);
+    Maze belief(3);
+    Navigator nav(belief, 1, 1, EAST);
+
+    const Dir h = nav.heading();
+    nav.recordWalls(truth.hasWall(1, 1, Navigator::leftOf(h)), truth.hasWall(1, 1, h),
+                    truth.hasWall(1, 1, Navigator::rightOf(h)));
+
+    Dir chosen = NORTH;
+    TEST_ASSERT_EQUAL(Navigator::Result::Turned, nav.step(0, 1, chosen));
+    TEST_ASSERT_EQUAL(WEST, chosen);
+    TEST_ASSERT_EQUAL(WEST, nav.heading()); // now facing the way it wants to go
+    TEST_ASSERT_EQUAL_UINT8(1, nav.x());    // but it has NOT moved
+    TEST_ASSERT_EQUAL_UINT8(1, nav.y());
+    TEST_ASSERT_EQUAL_UINT16(0, nav.moveCount());
+}
+
+// ------------------------------------------------------------------
+// the sensing guard: once a caller senses, it must keep sensing
+// ------------------------------------------------------------------
+
+// Senses once at (1,1) facing EAST, which is the state that produces a Turned.
+static void senseHere(const Maze &truth, Navigator &nav)
+{
+    const Dir h = nav.heading();
+    nav.recordWalls(truth.hasWall(nav.x(), nav.y(), Navigator::leftOf(h)),
+                    truth.hasWall(nav.x(), nav.y(), h),
+                    truth.hasWall(nav.x(), nav.y(), Navigator::rightOf(h)));
+}
+
+void test_step_after_turning_without_sensing_refuses_to_move()
+{
+    Maze truth(3);
+    truth.setWall(1, 1, WEST);
+    Maze belief(3);
+    Navigator nav(belief, 1, 1, EAST);
+
+    senseHere(truth, nav);
+    Dir chosen = NORTH;
+    TEST_ASSERT_EQUAL(Navigator::Result::Turned, nav.step(0, 1, chosen));
+    TEST_ASSERT_EQUAL(WEST, nav.heading());
+
+    // No recordWalls() this time. The three readings belong to the old heading,
+    // so moving would mean trusting the stale 'WEST is open' in the map.
+    TEST_ASSERT_EQUAL(Navigator::Result::NeedsSensing, nav.step(0, 1, chosen));
+    TEST_ASSERT_EQUAL_UINT8(1, nav.x()); // did not move
+    TEST_ASSERT_EQUAL_UINT8(1, nav.y());
+    TEST_ASSERT_EQUAL(WEST, nav.heading()); // and did not turn again
+    TEST_ASSERT_EQUAL_UINT16(0, nav.moveCount());
+
+    // Asking again must not quietly give in and move.
+    TEST_ASSERT_EQUAL(Navigator::Result::NeedsSensing, nav.step(0, 1, chosen));
+    TEST_ASSERT_EQUAL_UINT8(1, nav.x());
+    TEST_ASSERT_EQUAL_UINT16(0, nav.moveCount());
+}
+
+void test_fresh_readings_let_navigation_continue()
+{
+    Maze truth(3);
+    truth.setWall(1, 1, WEST);
+    Maze belief(3);
+    Navigator nav(belief, 1, 1, EAST);
+
+    senseHere(truth, nav);
+    Dir chosen = NORTH;
+    TEST_ASSERT_EQUAL(Navigator::Result::Turned, nav.step(0, 1, chosen));
+    TEST_ASSERT_EQUAL(Navigator::Result::NeedsSensing, nav.step(0, 1, chosen));
+
+    // Now give it the reading it asked for: facing WEST, the front sensor sees
+    // the wall that was behind the robot all along.
+    senseHere(truth, nav);
+    TEST_ASSERT_TRUE(belief.hasWall(1, 1, WEST));
+
+    // With the wall on the map it reroutes instead of driving into it.
+    TEST_ASSERT_EQUAL(Navigator::Result::Moved, nav.step(0, 1, chosen));
+    TEST_ASSERT_EQUAL(NORTH, chosen);
+    TEST_ASSERT_EQUAL_UINT8(1, nav.x());
+    TEST_ASSERT_EQUAL_UINT8(2, nav.y());
+    TEST_ASSERT_EQUAL_UINT16(1, nav.moveCount());
+}
+
+// A caller with a fully known map never calls recordWalls(), so the guard must
+// stay completely out of its way.
+void test_known_map_caller_moves_without_ever_sensing()
+{
+    Maze map(4); // open, and nothing has ever been sensed
+    Navigator nav(map, 0, 0, NORTH);
+
+    Dir chosen = SOUTH;
+    TEST_ASSERT_EQUAL(Navigator::Result::Moved, nav.step(0, 1, chosen));
+    TEST_ASSERT_EQUAL(NORTH, chosen);
+    TEST_ASSERT_EQUAL_UINT8(1, nav.y());
+    TEST_ASSERT_EQUAL_UINT16(1, nav.moveCount());
+}
+
+void test_known_map_navigation_is_unchanged_by_the_sensing_guard()
+{
+    // Same maze and the same expected move count as
+    // test_takes_the_detour_when_a_barrier_is_in_the_way, driven with the map
+    // fully known and recordWalls() never called.
+    Maze truth(4);
+    buildObstacles(truth);
+    Maze belief(4);
+    copyWalls(truth, belief);
+    Navigator nav(belief, 0, 3, SOUTH);
+
+    int steps = 0;
+    // drive() returns any non-Moved result, so a stray NeedsSensing or Turned
+    // would fail this assertion rather than pass unnoticed.
+    TEST_ASSERT_EQUAL(Navigator::Result::Arrived, drive(truth, nav, 3, 3, steps, false));
+    TEST_ASSERT_EQUAL_UINT16(9, nav.moveCount());
+}
+
 int main()
 {
     UNITY_BEGIN();
@@ -285,6 +441,14 @@ int main()
 
     RUN_TEST(test_solves_a_maze_it_has_to_discover);
     RUN_TEST(test_exploring_a_sealed_goal_still_terminates);
+
+    RUN_TEST(test_never_moves_backwards_through_an_unsensed_wall);
+    RUN_TEST(test_turning_to_check_a_wall_is_not_a_move);
+
+    RUN_TEST(test_step_after_turning_without_sensing_refuses_to_move);
+    RUN_TEST(test_fresh_readings_let_navigation_continue);
+    RUN_TEST(test_known_map_caller_moves_without_ever_sensing);
+    RUN_TEST(test_known_map_navigation_is_unchanged_by_the_sensing_guard);
 
     return UNITY_END();
 }
