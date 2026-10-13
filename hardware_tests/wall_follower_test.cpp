@@ -196,9 +196,106 @@ void setMotors(int l, int r) {
 }
 void stopMotors() { setMotors(0, 0); }
 
+// ======================= ABORT (serial 'x' or button) =======================
+void checkAbort() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'x' || c == 'X' || c == ' ') { abortReq = true; running = false; }
+  }
+  if (running && digitalRead(START_BTN) == LOW) {
+    delay(30);
+    if (digitalRead(START_BTN) == LOW) {
+      abortReq = true; running = false;
+      stopMotors();
+      while (digitalRead(START_BTN) == LOW) {}
+      delay(300);
+    }
+  }
+  if (abortReq) stopMotors();
+}
+
+// ======================= ULTRASONIC =======================
+float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
+float soundSpeedCmPerUs() { return (331.3 + 0.606 * airTempC) / 10000.0; }
+
+float readSonar(uint8_t i) {
+  digitalWrite(TRIG_PINS[i], LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PINS[i], HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PINS[i], LOW);
+  unsigned long us = pulseIn(ECHO_PINS[i], HIGH, ECHO_TIMEOUT_US);
+  if (us == 0) return NO_ECHO_CM;
+  float cm = cal.gain[i] * (us * soundSpeedCmPerUs() / 2.0) + cal.offset[i];
+  return (cm < 2.0) ? 2.0 : cm;
+}
+
+void resetFilters() {
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) { histN[i] = 0; histI[i] = 0; dist[i] = NO_ECHO_CM; }
+}
+
+void pushReading(uint8_t i, float d) {
+  raw[i] = d;
+  hist[i][histI[i]] = d;
+  histI[i] = (histI[i] + 1) % 3;
+  if (histN[i] < 3) histN[i]++;
+  if (histN[i] == 1)      dist[i] = d;
+  else if (histN[i] == 2) dist[i] = max(hist[i][0], hist[i][1]);  // bias to "far" until 3 readings
+  else                    dist[i] = med3(hist[i][0], hist[i][1], hist[i][2]);
+}
+
+float pingNow(uint8_t i) {
+  while (millis() - lastPingMs < PING_GAP_MS) checkAbort();
+  float d = readSonar(i);
+  lastPingMs = millis();
+  pushReading(i, d);
+  return d;
+}
+
+// Fires the next sensor only when the gap has passed; returns which one, or -1
+int8_t pollSonar() {
+  if (millis() - lastPingMs < PING_GAP_MS) return -1;
+  uint8_t s = PING_ORDER[pingStep];
+  pingStep = (pingStep + 1) & 3;
+  pingNow(s);
+  return s;
+}
+
+// tb = distance from axle to the entry edge of the cell whose far wall we test
+float frontLimit(float tb) { return tb + CELL_CM - SENSOR_AHEAD_CM - WALL_HALF_CM + FRONT_MARGIN_CM; }
+bool sideWallL(float d) { return d < L_SET + SIDE_MARGIN_CM; }
+bool sideWallR(float d) { return d < R_SET + SIDE_MARGIN_CM; }
+float sideLook() { return SIDE_SENSOR_AHEAD_CM - toBoundary; }
+
+// ---- wall votes (majority over several readings -> one bad echo can't fake a wall or an opening)
+void clearVotes() { nF = vF = nL = vL = nR = vR = 0; }
+void voteFront(float d, float tb) { if (nF < 250) { nF++; if (d < frontLimit(tb)) vF++; } }
+void voteL(float d) { if (nL < 250) { nL++; if (sideWallL(d)) vL++; } }
+void voteR(float d) { if (nR < 250) { nR++; if (sideWallR(d)) vR++; } }
+Walls votedWalls() {
+  Walls w;
+  w.f = (vF * 2 > nF);
+  w.l = (vL * 2 > nL);
+  w.r = (vR * 2 > nR);
+  return w;
+}
+
+Walls standingWalls(uint8_t rounds, float tb) {
+  stopMotors(); delay(150);
+  clearVotes();
+  for (uint8_t k = 0; k < rounds && !abortReq; k++) {
+    voteFront(pingNow(S_F), tb);
+    voteL(pingNow(S_L));
+    voteR(pingNow(S_R));
+  }
+  return votedWalls();
+}
+
 // ======================= SETUP / LOOP =======================
 void setup() {
   Serial.begin(115200);
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    pinMode(TRIG_PINS[i], OUTPUT); digitalWrite(TRIG_PINS[i], LOW);
+    pinMode(ECHO_PINS[i], INPUT);
+  }
   pinMode(L_RPWM, OUTPUT); pinMode(L_LPWM, OUTPUT); pinMode(L_EN, OUTPUT);
   pinMode(R_RPWM, OUTPUT); pinMode(R_LPWM, OUTPUT); pinMode(R_EN, OUTPUT);
   digitalWrite(L_EN, HIGH); digitalWrite(R_EN, HIGH);
@@ -211,7 +308,19 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(R_ENC_A), rightISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(R_ENC_B), rightISR, CHANGE);
 
+  pinMode(START_BTN, INPUT_PULLUP);
+
   COUNTS_PER_CM = (ENC_PPR * 4.0 * GEAR_RATIO) / (M_PI * WHEEL_DIA_CM);
+  resetFilters();
+
+  EEPROM.get(CAL_ADDR, cal);
+  if (cal.magic != CAL_MAGIC) {
+    for (uint8_t i = 0; i < NUM_SENSORS; i++) { cal.gain[i] = 1.0; cal.offset[i] = 0.0; }
+    Serial.println(F("No ultrasonic calibration in EEPROM -> raw readings."));
+  } else Serial.println(F("Ultrasonic calibration loaded."));
+
+  SidePts sp; EEPROM.get(SP_ADDR, sp);
+  if (sp.magic == SP_MAGIC) { L_SET = sp.lSet; R_SET = sp.rSet; }
 
   Serial.println(F("\n=== Maze Wall-Follower v3 ==="));
 }
@@ -219,6 +328,7 @@ void setup() {
 void loop() {
   if (!Serial.available()) return;
   char c = Serial.read();
+  abortReq = false;
   switch (c) {
     case 'x': stopMotors(); Serial.println(F("STOPPED")); break;
     case 'e': { long l, r; getCounts(l, r);
