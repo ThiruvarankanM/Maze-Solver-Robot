@@ -428,6 +428,166 @@ void approachFront(float targetCm) {
   delay(100);
 }
 
+// ======================= DECISION =======================
+Action decide(Walls w) {
+  bool prefOpen  = (rule == LEFT_HAND) ? !w.l : !w.r;
+  bool otherOpen = (rule == LEFT_HAND) ? !w.r : !w.l;
+  Action prefTurn  = (rule == LEFT_HAND) ? ACT_LEFT  : ACT_RIGHT;
+  Action otherTurn = (rule == LEFT_HAND) ? ACT_RIGHT : ACT_LEFT;
+  if (prefOpen)  return prefTurn;
+  if (!w.f)      return ACT_STRAIGHT;
+  if (otherOpen) return otherTurn;
+  return ACT_UTURN;
+}
+
+void logDecision(const __FlashStringHelper* tag, Walls w, Action a) {
+  Serial.print(tag);
+  Serial.print(F(" votes F")); Serial.print(vF); Serial.print('/'); Serial.print(nF);
+  Serial.print(F(" L")); Serial.print(vL); Serial.print('/'); Serial.print(nL);
+  Serial.print(F(" R")); Serial.print(vR); Serial.print('/'); Serial.print(nR);
+  Serial.print(F("  walls F")); Serial.print(w.f); Serial.print(F(" L")); Serial.print(w.l);
+  Serial.print(F(" R")); Serial.print(w.r);
+  Serial.print(F(" -> ")); Serial.println(ACTION_NAME[a]);
+}
+
+void turnHeading(Action a) {
+  if (a == ACT_LEFT)  heading = (heading + 3) & 3;
+  if (a == ACT_RIGHT) heading = (heading + 1) & 3;
+  if (a == ACT_UTURN) heading = (heading + 2) & 3;
+}
+
+// A wall follower that enters the same cell with the same heading twice is in a loop
+void enterCell() {
+  gx = constrain(gx + DX[heading], 0, GRID - 1);
+  gy = constrain(gy + DY[heading], 0, GRID - 1);
+  uint8_t bit = 1 << heading;
+  if (seen[gx][gy] & bit) {
+    rule = (rule == LEFT_HAND) ? RIGHT_HAND : LEFT_HAND;
+    memset(seen, 0, sizeof(seen));
+    Serial.println(F("[LOOP] been here before -> switching hand rule"));
+  }
+  seen[gx][gy] |= bit;
+}
+
+void resumeCruise() {
+  cruisePwm = DEADBAND_PWM + 10;
+  for (uint8_t i = 0; i < 3; i++) anc[i].ok = false;
+  syncOdom();
+}
+
+// After a turn we assume it ended straight; the first wall-angle reading corrects whatever is left
+void afterManeuver() {
+  psi = 0; psiTarget = 0; turnCheck = true;
+  resetFilters();
+  clearVotes();
+  resumeCruise();
+}
+
+// Dead end: reverse straight back cell by cell until a side opens, then turn into it
+void reverseOut() {
+  float stop = reverseStop();
+  float f = med3(pingNow(S_F), pingNow(S_F), pingNow(S_F));
+  float a = (f < FRONT_TRUST_CM) ? f + SENSOR_AHEAD_CM + WALL_HALF_CM : toBoundary + CELL_CM;  // axle -> dead-end wall
+
+  for (uint8_t k = 1; k <= MAX_REVERSE_CELLS && !abortReq; k++) {
+    float target = k * CELL_CM + stop;
+    if (target > a) wheelMove(a - target, a - target, REVERSE_PWM, 4000);
+    a = target;
+    float frontTarget = target - SENSOR_AHEAD_CM - WALL_HALF_CM;
+    if (frontTarget < FRONT_TRUST_CM) approachFront(frontTarget);
+
+    Walls w = standingWalls(CONFIRM_ROUNDS, 0);
+    if (abortReq) return;
+    if (w.l && w.r) continue;
+
+    // both open: take the side the hand rule would pick after turning around
+    Action t;
+    if (!w.l && !w.r) t = (rule == LEFT_HAND) ? ACT_RIGHT : ACT_LEFT;
+    else t = w.l ? ACT_RIGHT : ACT_LEFT;
+    logDecision(F("[REVERSE-OUT]"), w, t);
+
+    gx = constrain(gx - k * DX[heading], 0, GRID - 1);
+    gy = constrain(gy - k * DY[heading], 0, GRID - 1);
+    float R = reverseOutRadius();
+    arcTurn(t == ACT_LEFT ? -1 : 1, R);
+    toBoundary = HALF_CELL - R;
+    turnHeading(t);
+    return;
+  }
+  Serial.println(F("[REVERSE-OUT] no opening found -> stopping"));
+  abortReq = true; running = false;
+  stopMotors();
+}
+
+// Turn from where the robot stands (start, recovery). 90° spins assume it is near the cell centre.
+void pivot(Action a) {
+  if (a == ACT_UTURN) { reverseOut(); return; }
+  spinDeg(a == ACT_LEFT ? -90 : 90);
+  toBoundary = HALF_CELL;
+  turnHeading(a);
+}
+
+// Stop, recheck all walls standing still, then act. frontWall = the front sensor already saw a wall.
+void confirmAndAct(bool frontWall) {
+  Walls w = standingWalls(CONFIRM_ROUNDS, toBoundary);
+  if (frontWall) w.f = true;
+  Action a = decide(w);
+  logDecision(F("[CONFIRM]"), w, a);
+  if (abortReq) return;
+
+  if (a == ACT_STRAIGHT) {
+    toBoundary += CELL_CM;
+    clearVotes();
+    resumeCruise();
+    return;
+  }
+  if (a == ACT_LEFT || a == ACT_RIGHT) {
+    float R = arcRadius();
+    if (w.f) approachFront(arcFrontTarget(R));
+    else {
+      float pre = (HALF_CELL - R) + toBoundary;
+      if (pre > 0.3) driveCm(pre);
+    }
+    if (!abortReq) arcTurn(a == ACT_LEFT ? -1 : 1, R);
+    toBoundary = HALF_CELL - R;
+    turnHeading(a);
+  } else {
+    pivot(a);
+  }
+  afterManeuver();
+}
+
+// Called when odometry says the side sensors can see into the next cell
+void atDecisionPoint() {
+  enterCell();
+  bool enough = nF >= MIN_SAMPLES && nL >= MIN_SAMPLES && nR >= MIN_SAMPLES;
+  Walls w = votedWalls();
+  Action a = enough ? decide(w) : ACT_UTURN;
+  if (enough) logDecision(F("[CELL]"), w, a);
+  if (a != ACT_STRAIGHT) { confirmAndAct(false); return; }
+  toBoundary += CELL_CM;
+  clearVotes();
+}
+
+// Front sensor sees a close wall: it wins over odometry and side readings, decide right here
+void frontStop(float f) {
+  stopMotors();
+  Serial.println(F("[FRONT] wall close -> stop and decide"));
+  if (toBoundary > 0) enterCell();   // odometry hadn't reached this cell yet
+  toBoundary = f + SENSOR_AHEAD_CM + WALL_HALF_CM - CELL_CM;
+  confirmAndAct(true);
+}
+
+// Wheels stuck (scraping a wall): back off, then let the front sensor decide
+void recoverFromStall() {
+  Serial.println(F("[STALL] wheels stuck -> backing off"));
+  wheelMove(-STALL_BACK_CM, -STALL_BACK_CM, REVERSE_PWM, 1500);
+  toBoundary += STALL_BACK_CM;
+  float f = med3(pingNow(S_F), pingNow(S_F), pingNow(S_F));
+  if (f < frontStopCm()) frontStop(f);
+  else { resetFilters(); resumeCruise(); }
+}
+
 // ======================= SETUP / LOOP =======================
 void setup() {
   Serial.begin(115200);
@@ -479,6 +639,8 @@ void loop() {
     case '<': Serial.println(F("Arc left 90"));  arcTurn(-1, arcRadius()); break;
     case '>': Serial.println(F("Arc right 90")); arcTurn(1, arcRadius());  break;
     case 'U': Serial.println(F("Spin 180"));     spinDeg(180); break;
+    case 'L': rule = LEFT_HAND;  Serial.println(F("LEFT-hand rule"));  break;
+    case 'R': rule = RIGHT_HAND; Serial.println(F("RIGHT-hand rule")); break;
     default: break;
   }
 }
