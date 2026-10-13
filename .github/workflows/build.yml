@@ -21,5 +21,7 @@ jobs:
       - run: pip install platformio
       - name: Build firmware
         run: pio run -e mega
+      - name: Build simulator
+        run: pio run -e sim
       - name: Run tests
         run: pio test -e native

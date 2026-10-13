@@ -1,5 +1,6 @@
 // ===== QYF-750 (QTR-8RC type) IR ARRAY TEST + CALIBRATION — EE4360 =====
 // Sensors D1..D8 -> A8..A15 (PORTK bit0..bit7), read as RC timing
+#include <Arduino.h>
 #include <EEPROM.h>
 
 const uint8_t  NUM_SENSORS    = 8;
