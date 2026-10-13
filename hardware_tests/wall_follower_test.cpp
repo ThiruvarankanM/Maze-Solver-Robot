@@ -588,9 +588,177 @@ void recoverFromStall() {
   else { resetFilters(); resumeCruise(); }
 }
 
+// ======================= WALL FOLLOWING =======================
+// Wall gyro: the change in side distance per cm driven gives the robot's angle to that wall
+void wallAngle(uint8_t s) {
+  Anchor &a = anc[s];
+  float d = raw[s];
+  bool wall = (s == S_L) ? sideWallL(d) : sideWallR(d);
+  if (!wall || d <= 2.0 || histN[s] < 2 || fabs(d - dist[s]) > OUTLIER_CM) { a.ok = false; return; }
+  if (!a.ok) { a = {true, d, odoCm, psi}; return; }
+  float ds = odoCm - a.s;
+  if (ds < SLOPE_BASE_CM) return;
+
+  float dy = (s == S_R) ? (d - a.d) : (a.d - d);    // sideways move of the sensor, + = left
+  dy -= SIDE_SENSOR_AHEAD_CM * (psi - a.psi);       // remove the part caused by rotating
+  float err = atan2(dy, ds) - (psi + a.psi) / 2.0;  // wall says vs encoders say (window average)
+  if (turnCheck) {
+    Serial.print(F("[TURN] ended ")); Serial.print(degrees(err), 1); Serial.println(F(" deg off (+ = too far left)"));
+    turnCheck = false;
+  }
+  psi += K_FUSE * err;
+  a = {true, d, odoCm, psi};
+}
+
+// Off-centre -> aim a few degrees back toward the centre line (no walls -> aim straight)
+void updateTarget() {
+  if (cruisePwm < BASE_PWM) cruisePwm = min(BASE_PWM, cruisePwm + CRUISE_STEP);
+  bool lW = histN[S_L] >= 2 && sideWallL(dist[S_L]);
+  bool rW = histN[S_R] >= 2 && sideWallR(dist[S_R]);
+  float err = 0;                                    // + = too far right
+  if (lW && rW)  err = ((dist[S_L] - L_SET) - (dist[S_R] - R_SET)) / 2.0;
+  else if (lW)   err = dist[S_L] - L_SET;
+  else if (rW)   err = R_SET - dist[S_R];
+  err = constrain(err, -MAX_ERR_CM, MAX_ERR_CM);
+  psiTarget = constrain(K_POS * err, -MAX_PSI, MAX_PSI);
+}
+
+void steer() {
+  float st = constrain(K_PSI * (psiTarget - psi), -MAX_STEER, MAX_STEER);
+  setMotors(cruisePwm - st, cruisePwm + st);
+}
+
+// ======================= MAIN STEP =======================
+void startRun() {
+  running = true; abortReq = false;
+  memset(seen, 0, sizeof(seen));
+  gx = G0; gy = G0; heading = 0;
+  seen[G0][G0] = 1;
+  toBoundary = CELL_CM - START_AXLE_FROM_BACK_CM;
+  resetFilters();
+
+  Walls w = standingWalls(CONFIRM_ROUNDS, toBoundary - CELL_CM);
+  if (w.f && !abortReq) {
+    logDecision(F("[START]"), w, decide(w));
+    Serial.println(F("[START] facing a wall - can't turn in the start cell. Place it facing the open side."));
+    abortReq = true; running = false; stopMotors();
+    return;
+  }
+  afterManeuver();
+  Serial.println(F("GO"));
+}
+
+void mazeStep() {
+  long l, r; getCounts(l, r);
+  if (labs((l - stallRefL) + (r - stallRefR)) > 2.0 * STALL_MIN_CM * COUNTS_PER_CM) {
+    stallRefL = l; stallRefR = r; lastMoveMs = millis();
+  }
+  float move = ((l - prevL) + (r - prevR)) / 2.0 / COUNTS_PER_CM;
+  toBoundary -= move;
+  odoCm += move;
+  psi += ((r - prevR) - (l - prevL)) / COUNTS_PER_CM / TRACK_CM;
+  prevL = l; prevR = r;
+
+  int8_t s = pollSonar();
+  if (s == S_F) {
+    nearF = (raw[S_F] < frontStopCm()) ? nearF + 1 : 0;
+    if (nearF >= FRONT_STOP_HITS) { frontStop(raw[S_F]); return; }
+    if (toBoundary <= FRONT_WINDOW_CM) voteFront(raw[S_F], toBoundary);
+
+    // walls sit on cell edges, so a front wall tells us where we are in the cell
+    if (raw[S_F] < FRONT_CORR_MAX_CM) {
+      float wallDist = raw[S_F] + SENSOR_AHEAD_CM + WALL_HALF_CM;
+      long k = lround((wallDist - toBoundary) / CELL_CM);
+      if (k < 0) k = 0;
+      float tb = wallDist - k * CELL_CM;
+      if (fabs(tb - toBoundary) < 6.0) toBoundary += 0.5 * (tb - toBoundary);
+    }
+  } else if (s == S_L || s == S_R) {
+    float look = sideLook();
+    if (look >= SIDE_LOOK_MIN_CM && look <= SIDE_LOOK_MAX_CM) {
+      if (s == S_L) voteL(raw[S_L]); else voteR(raw[S_R]);
+    }
+    wallAngle(s);
+    updateTarget();
+  }
+  steer();
+
+  if (millis() - lastMoveMs > STALL_MS) { recoverFromStall(); return; }
+  if (toBoundary <= -decisionOffset()) atDecisionPoint();
+}
+
+// ======================= TOOLS =======================
+void dryRun() {
+  Serial.println(F("\nDry run (motors OFF) — press any key + Enter to stop."));
+  while (Serial.available()) Serial.read();
+  resetFilters();
+  unsigned long lastPrint = 0;
+  while (!Serial.available()) {
+    pollSonar();
+    if (millis() - lastPrint < 200) continue;
+    lastPrint = millis();
+    Walls w = { dist[S_F] < frontLimit(0), sideWallL(dist[S_L]), sideWallR(dist[S_R]) };
+    Serial.print(F("F=")); Serial.print(dist[S_F], 1);
+    Serial.print(F(" L=")); Serial.print(dist[S_L], 1);
+    Serial.print(F(" R=")); Serial.print(dist[S_R], 1);
+    Serial.print(F("  walls F")); Serial.print(w.f); Serial.print(F(" L")); Serial.print(w.l);
+    Serial.print(F(" R")); Serial.print(w.r);
+    Serial.print(F(" -> ")); Serial.println(ACTION_NAME[decide(w)]);
+  }
+  while (Serial.available()) Serial.read();
+}
+
+void captureSetpoints() {
+  Serial.println(F("Capturing side setpoints — robot must be CENTERED in a corridor."));
+  float ls = 0, rs = 0; uint8_t n = 0;
+  for (uint8_t k = 0; k < 10; k++) {
+    float l = pingNow(S_L), r = pingNow(S_R);
+    if (l < 20.0 && r < 20.0) { ls += l; rs += r; n++; }
+  }
+  if (n < 5) { Serial.println(F("Both side walls not seen reliably. Not saved.")); return; }
+  L_SET = ls / n; R_SET = rs / n;
+  SidePts sp = {SP_MAGIC, L_SET, R_SET};
+  EEPROM.put(SP_ADDR, sp);
+  Serial.print(F("Saved L_SET=")); Serial.print(L_SET, 2);
+  Serial.print(F(" R_SET=")); Serial.println(R_SET, 2);
+}
+
+void deadbandTest() {
+  Serial.println(F("\nDeadband test — WHEELS OFF THE GROUND."));
+  const char* const wn[2] = {"Left", "Right"};
+  int worst = 0;
+  for (uint8_t w = 0; w < 2; w++) {
+    for (int8_t d = 1; d >= -1; d -= 2) {
+      resetCounts();
+      int found = -1;
+      for (int pwm = 0; pwm <= 150; pwm += 2) {
+        if (w == 0) setMotors(d * pwm, 0); else setMotors(0, d * pwm);
+        delay(120);
+        long l, r; getCounts(l, r);
+        if (labs(w == 0 ? l : r) > 20) { found = pwm; break; }
+      }
+      stopMotors(); delay(400);
+      Serial.print(wn[w]); Serial.print(d > 0 ? F(" fwd: ") : F(" rev: "));
+      if (found < 0) Serial.println(F("did not move up to 150 (check wiring/encoder)"));
+      else { Serial.print(found); Serial.println(F(" PWM")); if (found > worst) worst = found; }
+    }
+  }
+  Serial.print(F("Set DEADBAND_PWM to about ")); Serial.println(worst);
+}
+
+void printHelp() {
+  Serial.println(F("\ng=go x=stop d=dry-run z=setpoints G=geometry m=deadband e=encoders"));
+  Serial.println(F("F=1 cell  <=arc left  >=arc right  U=180 spin  L/R=hand rule  h=help"));
+  Serial.print(F("Rule: ")); Serial.println(rule == LEFT_HAND ? F("LEFT-hand") : F("RIGHT-hand"));
+  Serial.print(F("L_SET=")); Serial.print(L_SET, 2);
+  Serial.print(F(" R_SET=")); Serial.print(R_SET, 2);
+  Serial.print(F("  counts/cm=")); Serial.println(COUNTS_PER_CM, 2);
+}
+
 // ======================= SETUP / LOOP =======================
 void setup() {
   Serial.begin(115200);
+
   for (uint8_t i = 0; i < NUM_SENSORS; i++) {
     pinMode(TRIG_PINS[i], OUTPUT); digitalWrite(TRIG_PINS[i], LOW);
     pinMode(ECHO_PINS[i], INPUT);
@@ -624,23 +792,46 @@ void setup() {
 
   Serial.println(F("\n=== Maze Wall-Follower v3 ==="));
   geometryReport();
+  printHelp();
 }
 
 void loop() {
+  if (!running && digitalRead(START_BTN) == LOW) {
+    delay(30);
+    if (digitalRead(START_BTN) == LOW) {
+      while (digitalRead(START_BTN) == LOW) {}
+      delay(500);
+      startRun();
+    }
+  }
+
+  if (running) {
+    checkAbort();
+    if (!running) { Serial.println(F("STOPPED")); return; }
+    mazeStep();
+    if (abortReq) { stopMotors(); Serial.println(F("STOPPED")); }
+    return;
+  }
+
   if (!Serial.available()) return;
   char c = Serial.read();
   abortReq = false;
   switch (c) {
+    case 'g': startRun(); break;
     case 'x': stopMotors(); Serial.println(F("STOPPED")); break;
+    case 'd': dryRun(); break;
+    case 'z': captureSetpoints(); break;
+    case 'G': geometryReport(); break;
+    case 'm': deadbandTest(); break;
     case 'e': { long l, r; getCounts(l, r);
                 Serial.print(F("L=")); Serial.print(l); Serial.print(F(" R=")); Serial.println(r); } break;
-    case 'G': geometryReport(); break;
     case 'F': Serial.println(F("Drive 1 cell")); driveCm(CELL_CM); break;
     case '<': Serial.println(F("Arc left 90"));  arcTurn(-1, arcRadius()); break;
     case '>': Serial.println(F("Arc right 90")); arcTurn(1, arcRadius());  break;
     case 'U': Serial.println(F("Spin 180"));     spinDeg(180); break;
     case 'L': rule = LEFT_HAND;  Serial.println(F("LEFT-hand rule"));  break;
     case 'R': rule = RIGHT_HAND; Serial.println(F("RIGHT-hand rule")); break;
+    case 'h': printHelp(); break;
     default: break;
   }
 }
