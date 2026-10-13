@@ -1,187 +1,157 @@
-// ===== QYF-750 (QTR-8RC type) IR ARRAY TEST + CALIBRATION — EE4360 =====
-// Sensors D1..D8 -> A8..A15 (PORTK bit0..bit7), read as RC timing
-#include <Arduino.h>
-#include <EEPROM.h>
+/*
+  IR Sensor Array Tester (Arduino Mega 2560) - 8 channels
+  -------------------------------------------------------
+  WIRING
+    Sensor VCC -> 5V
+    Sensor GND -> GND
+    Sensor emitter supply -> ICSP header pin 2 (5V)
+      ICSP pin layout (6-pin header near the ATmega2560):   1 MISO  2 5V
+                                                            3 SCK   4 MOSI
+                                                            5 RESET 6 GND
+      (Any other 5V pin on the Mega also works, e.g. the power header or
+       the 5V pins at the top of the double-row header next to D22/D23.)
+    (Emitters are always ON, so the ON/OFF emitter check is disabled.
+     Use a phone camera to confirm every IR LED glows.)
 
-const uint8_t  NUM_SENSORS    = 8;
-const int8_t   IR_EMITTER_PIN = 36;    // board "IR" pin; -1 if not connected
-const uint8_t  CAL_BUTTON     = 40;    // button to GND
-const uint16_t TIMEOUT_US     = 2500;  // max discharge time (= "fully dark")
-const uint16_t CAL_TIME_MS    = 6000;
-const uint16_t LINE_THRESH    = 300;   // normalized > this = on line
-const uint16_t MIN_RANGE      = 200;   // us; warn if contrast below this
-const bool     REVERSE_ORDER  = false; // true if D1 is on the RIGHT side of your robot
+    ANALOG mode : channels D1..D8 -> A0..A7   (same as IR_PINS in pins.h)
+    DIGITAL mode: channels D1..D8 -> D42..D49
+                  (D2-D9 are not used on the Mega because D2/D3 are the left
+                   encoder and D5-D8 are the motor PWM pins in pins.h)
 
-struct CalData {
-  uint16_t magic;
-  uint16_t minV[NUM_SENSORS];
-  uint16_t maxV[NUM_SENSORS];
-  bool invert;
-};
-const uint16_t CAL_MAGIC = 0xC750;     // new magic so old analog cal isn't loaded
-CalData cal;
+  (Optional: if you later wire the emitter ENABLE/LEDON pin to D10 instead,
+   set USE_EMITTER_PIN to 1 to get the automatic per-channel emitter check.)
 
-uint16_t raw[NUM_SENSORS], norm[NUM_SENSORS];
-bool calibrated = false;
-int lastPosition = 3500;
-enum Mode { MODE_RAW, MODE_NORM, MODE_POS } mode = MODE_RAW;
+  WHAT IT TESTS
+    1. Reflectance: sweep over black/white -> each channel should swing.
+    2. Emitter check (analog mode): emitters are switched OFF then ON for each
+       reading. A working emitter makes a big ON/OFF difference over white.
+       "EMIT?" = no difference -> emitter LED for that channel likely dead.
 
-// ---------- RC reading (all 8 in parallel on PORTK) ----------
-void readRaw() {
-  uint16_t t8[NUM_SENSORS];
-  for (uint8_t i = 0; i < NUM_SENSORS; i++) t8[i] = TIMEOUT_US;
+  Serial Monitor: 115200 baud. Type 'r' to reset min/max.
+*/
 
-  if (IR_EMITTER_PIN >= 0) { digitalWrite(IR_EMITTER_PIN, HIGH); delayMicroseconds(200); }
+#define USE_ANALOG      1   // 1 = analog outputs, 0 = digital outputs
+#define USE_EMITTER_PIN 0   // 0 = emitters powered from 5V (always ON)
+#define EMITTER_PIN     10  // only used when USE_EMITTER_PIN = 1 (D10 is free in pins.h)
 
-  DDRK  = 0xFF;  PORTK = 0xFF;          // drive all HIGH -> charge capacitors
-  delayMicroseconds(10);
-  DDRK  = 0x00;  PORTK = 0x00;          // switch to input, no pull-ups
+#if USE_ANALOG
+  //                         D1  D2  D3  D4  D5  D6  D7  D8   (left -> right)
+  const int sensorPins[] = {A0, A1, A2, A3, A4, A5, A6, A7};
+  const int SWING_OK = 200;   // min reflectance change (of 1023)
+  const int EMIT_OK  = 100;   // min ON-vs-OFF difference (of 1023)
+#else
+  //                         D1  D2  D3  D4  D5  D6  D7  D8
+  const int sensorPins[] = {42, 43, 44, 45, 46, 47, 48, 49};
+  const int SWING_OK = 1;
+#endif
+const int N = sizeof(sensorPins) / sizeof(sensorPins[0]);
 
-  uint32_t start = micros();
-  uint8_t pending = 0xFF;
-  while (pending) {
-    uint32_t t = micros() - start;
-    if (t >= TIMEOUT_US) break;
-    uint8_t fell = pending & ~PINK;      // bits that just went LOW
-    if (fell) {
-      for (uint8_t i = 0; i < NUM_SENSORS; i++)
-        if (fell & (1 << i)) t8[i] = t;
-      pending &= ~fell;
-    }
-  }
+int minVal[8], maxVal[8], maxEmitDiff[8];
 
-  if (IR_EMITTER_PIN >= 0) digitalWrite(IR_EMITTER_PIN, LOW);   // saves power between reads
-
-  for (uint8_t i = 0; i < NUM_SENSORS; i++)
-    raw[i] = REVERSE_ORDER ? t8[NUM_SENSORS - 1 - i] : t8[i];
+void resetMinMax() {
+  for (int i = 0; i < N; i++) { minVal[i] = 1023; maxVal[i] = 0; maxEmitDiff[i] = 0; }
 }
 
-// 0 = background, 1000 = line
-void readNormalized() {
-  readRaw();
-  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-    long range = (long)cal.maxV[i] - cal.minV[i];
-    long v = 0;
-    if (range > 0) v = ((long)raw[i] - cal.minV[i]) * 1000L / range;
-    v = constrain(v, 0, 1000);
-    if (cal.invert) v = 1000 - v;
-    norm[i] = v;
-  }
+void emitters(bool on) {
+#if USE_EMITTER_PIN
+  digitalWrite(EMITTER_PIN, on ? HIGH : LOW);
+  delayMicroseconds(300);   // let LEDs / phototransistors settle
+#else
+  (void)on;
+#endif
 }
 
-// 0..7000, 3500 = centred
-int readPosition(bool &lost, uint8_t &activeCount) {
-  readNormalized();
-  long weighted = 0, sum = 0;
-  activeCount = 0;
-  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-    if (norm[i] > LINE_THRESH) activeCount++;
-    if (norm[i] > 50) { weighted += (long)norm[i] * (i * 1000L); sum += norm[i]; }
-  }
-  lost = (activeCount == 0);
-  if (lost) return (lastPosition < 3500) ? 0 : 7000;
-  lastPosition = weighted / sum;
-  return lastPosition;
-}
-
-// ---------- calibration ----------
-void calibrate() {
-  for (uint8_t i = 0; i < NUM_SENSORS; i++) { cal.minV[i] = TIMEOUT_US; cal.maxV[i] = 0; }
-  Serial.println(F("\n>> CALIBRATING: sweep the array slowly across the line, back and forth..."));
-  unsigned long start = millis(), lastTick = 0;
-  while (millis() - start < CAL_TIME_MS) {
-    readRaw();
-    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-      if (raw[i] < cal.minV[i]) cal.minV[i] = raw[i];
-      if (raw[i] > cal.maxV[i]) cal.maxV[i] = raw[i];
-    }
-    if (millis() - lastTick >= 1000) {
-      lastTick = millis();
-      Serial.print((CAL_TIME_MS - (millis() - start)) / 1000 + 1); Serial.println(F("s..."));
-    }
-  }
-  calibrated = true;
-  Serial.println(F(">> Done.\nS#\tmin(us)\tmax(us)\trange"));
-  bool ok = true;
-  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-    uint16_t r = cal.maxV[i] - cal.minV[i];
-    Serial.print(i + 1); Serial.print('\t'); Serial.print(cal.minV[i]); Serial.print('\t');
-    Serial.print(cal.maxV[i]); Serial.print('\t'); Serial.print(r);
-    if (r < MIN_RANGE) { Serial.print(F("  <-- LOW CONTRAST")); ok = false; }
-    Serial.println();
-  }
-  if (!ok) Serial.println(F("!! Some sensors never saw both surfaces. Sweep wider or lower the array (~3 mm)."));
-  Serial.println(F(">> Centre the array on the line, press 'n'. On-line sensors should read ~1000."));
-  Serial.println(F("   If ~0, press 'i'. Then 's' to save."));
-}
-
-void saveCal() { cal.magic = CAL_MAGIC; EEPROM.put(0, cal); Serial.println(F(">> Saved to EEPROM")); }
-bool loadCal() {
-  CalData tmp; EEPROM.get(0, tmp);
-  if (tmp.magic != CAL_MAGIC) return false;
-  cal = tmp; calibrated = true; return true;
-}
-
-void printBars() {
-  Serial.print('|');
-  for (uint8_t i = 0; i < NUM_SENSORS; i++) Serial.print(norm[i] > LINE_THRESH ? '#' : '.');
-  Serial.print("| ");
+int readSensor(int i) {
+#if USE_ANALOG
+  return analogRead(sensorPins[i]);
+#else
+  return digitalRead(sensorPins[i]);
+#endif
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(CAL_BUTTON, INPUT_PULLUP);
-  if (IR_EMITTER_PIN >= 0) { pinMode(IR_EMITTER_PIN, OUTPUT); digitalWrite(IR_EMITTER_PIN, LOW); }
-  cal.invert = false;
-  if (loadCal()) { Serial.println(F("Calibration loaded.")); mode = MODE_POS; }
-  else           { Serial.println(F("No calibration saved. Showing RAW (us). Press 'c' or the button.")); }
-  Serial.println(F("Cmds: c=cal r=raw n=norm p=pos i=invert s=save l=load x=clear"));
+  for (int i = 0; i < N; i++) pinMode(sensorPins[i], INPUT);
+#if USE_EMITTER_PIN
+  pinMode(EMITTER_PIN, OUTPUT);
+  digitalWrite(EMITTER_PIN, HIGH);
+#endif
+  resetMinMax();
+  Serial.println(F("\n=== IR Sensor Array Test (Mega 2560, 8 ch) ==="));
+  Serial.println(F("Sweep the sensor over black and white. Type 'r' to reset.\n"));
 }
 
 void loop() {
-  if (Serial.available()) {
-    char ch = Serial.read();
-    switch (ch) {
-      case 'c': calibrate(); break;
-      case 'r': mode = MODE_RAW; break;
-      case 'n': if (calibrated) mode = MODE_NORM; else Serial.println(F("Calibrate first")); break;
-      case 'p': if (calibrated) mode = MODE_POS;  else Serial.println(F("Calibrate first")); break;
-      case 'i': cal.invert = !cal.invert; Serial.print(F(">> invert = ")); Serial.println(cal.invert); break;
-      case 's': saveCal(); break;
-      case 'l': Serial.println(loadCal() ? F(">> Loaded") : F(">> Nothing saved")); break;
-      case 'x': EEPROM.put(0, (uint16_t)0); calibrated = false; mode = MODE_RAW; Serial.println(F(">> Cleared")); break;
+  if (Serial.available() && Serial.read() == 'r') {
+    resetMinMax();
+    Serial.println(F("\n-- min/max reset --\n"));
+  }
+
+  int v[8];
+#if USE_ANALOG && USE_EMITTER_PIN
+  int off[8];
+  emitters(false);
+  for (int i = 0; i < N; i++) off[i] = readSensor(i);
+#endif
+
+  emitters(true);
+  for (int i = 0; i < N; i++) {
+    v[i] = readSensor(i);
+    if (v[i] < minVal[i]) minVal[i] = v[i];
+    if (v[i] > maxVal[i]) maxVal[i] = v[i];
+#if USE_ANALOG && USE_EMITTER_PIN
+    int d = abs(v[i] - off[i]);
+    if (d > maxEmitDiff[i]) maxEmitDiff[i] = d;
+#endif
+  }
+
+  // Live values (emitters ON)
+  Serial.print(F("Live: "));
+  for (int i = 0; i < N; i++) {
+#if USE_ANALOG
+    char buf[6]; sprintf(buf, "%4d ", v[i]); Serial.print(buf);
+#else
+    Serial.print(v[i] ? F("# ") : F(". "));   // # = HIGH, . = LOW
+#endif
+  }
+
+  // Status per channel
+  Serial.print(F(" | "));
+  for (int i = 0; i < N; i++) {
+    Serial.print(F("S")); Serial.print(i + 1);
+    bool swingOK = (maxVal[i] - minVal[i]) >= SWING_OK;
+#if USE_ANALOG && USE_EMITTER_PIN
+    bool emitOK = maxEmitDiff[i] >= EMIT_OK;
+    if (swingOK && emitOK) Serial.print(F(":OK "));
+    else if (!emitOK)      Serial.print(F(":EMIT? "));
+    else                   Serial.print(F(":DEAD? "));
+#else
+    Serial.print(swingOK ? F(":OK ") : F(":DEAD? "));
+#endif
+  }
+  Serial.println();
+
+  // Summary every ~3 s
+  static unsigned long lastSum = 0;
+  if (millis() - lastSum > 3000) {
+    lastSum = millis();
+#if USE_ANALOG && USE_EMITTER_PIN
+    Serial.println(F("\n  Ch   Min   Max  Swing  On-Off"));
+#else
+    Serial.println(F("\n  Ch   Min   Max  Swing"));
+#endif
+    for (int i = 0; i < N; i++) {
+      char buf[40];
+#if USE_ANALOG && USE_EMITTER_PIN
+      sprintf(buf, "  S%d  %4d  %4d  %4d   %4d", i + 1, minVal[i], maxVal[i],
+              maxVal[i] - minVal[i], maxEmitDiff[i]);
+#else
+      sprintf(buf, "  S%d  %4d  %4d  %4d", i + 1, minVal[i], maxVal[i], maxVal[i] - minVal[i]);
+#endif
+      Serial.println(buf);
     }
-  }
-
-  if (digitalRead(CAL_BUTTON) == LOW) {
-    delay(30);
-    if (digitalRead(CAL_BUTTON) == LOW) {
-      while (digitalRead(CAL_BUTTON) == LOW);
-      calibrate(); saveCal(); mode = MODE_POS;
-    }
-  }
-
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint < 100) return;
-  lastPrint = millis();
-
-  if (mode == MODE_RAW) {
-    readRaw();
-    for (uint8_t i = 0; i < NUM_SENSORS; i++) { Serial.print(raw[i]); Serial.print('\t'); }
-    Serial.println();
-  } else if (mode == MODE_NORM) {
-    readNormalized(); printBars();
-    for (uint8_t i = 0; i < NUM_SENSORS; i++) { Serial.print(norm[i]); Serial.print('\t'); }
-    Serial.println();
-  } else {
-    bool lost; uint8_t active;
-    int pos = readPosition(lost, active);
-    printBars();
-    Serial.print(F("pos=")); Serial.print(pos);
-    Serial.print(F("  error=")); Serial.print(pos - 3500);
-    Serial.print(F("  active=")); Serial.print(active);
-    if (lost) Serial.print(F("  LINE LOST"));
-    if (active >= 6) Serial.print(F("  WIDE PATCH (tile/marker?)"));
     Serial.println();
   }
+
+  delay(150);
 }
