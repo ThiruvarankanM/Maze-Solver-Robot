@@ -115,7 +115,7 @@ const float FRONT_WINDOW_CM   = 8.0;
 const uint8_t MIN_SAMPLES     = 2;
 const uint8_t CONFIRM_ROUNDS  = 5;     // standing re-check before any turn
 const float FRONT_CORR_MAX_CM = 30.0;
-const float FRONT_STOP_MARGIN_CM = 3.0;  // stop this much before the arc start distance
+const float FRONT_STOP_MARGIN_CM = 1.0;  // stop this much before the arc start distance
 const uint8_t FRONT_STOP_HITS = 2;       // consecutive close front readings needed to stop
 const unsigned long STALL_MS  = 400;
 const float STALL_MIN_CM      = 0.5;     // less travel than this in STALL_MS = stuck
