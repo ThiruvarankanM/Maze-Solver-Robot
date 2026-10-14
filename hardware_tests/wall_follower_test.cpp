@@ -8,14 +8,13 @@
     z = capture side setpoints (robot CENTERED in a corridor with both walls)
     G = geometry / clearance report             m = motor deadband test (wheels OFF ground)
     e = encoder counts                          F = drive one cell (25 cm)
-    < = arc turn LEFT test   > = arc turn RIGHT test   U = 180 spin test
+    < = spin LEFT 90 test    > = spin RIGHT 90 test    U = 180 spin test
     L = left-hand rule       R = right-hand rule       h = help
-  Push button D40 (to GND): press = GO, press again = STOP.
+  AUTO START: runs by itself 5 s after power-on. Send any key in those 5 s to stay in command mode.
 
   START POSITION: robot in the start cell, centered, REAR touching the back wall.
-  It must face the open side (it can't turn in the start cell).
   FRONT FIRST: a close front wall always stops the robot and triggers a standing wall check.
-  DEAD ENDS: no spinning (the robot doesn't fit). It reverses to the first side opening and turns there.
+  TURNS: drive to the cell centre, spin 90° (180° in a dead end) in place, drive on.
 */
 
 #include <Arduino.h>
@@ -32,10 +31,10 @@ struct Walls { bool f; bool l; bool r; };
 const float CELL_CM              = 25.0;
 const float HALF_CELL            = 12.5;
 const float ROBOT_WIDTH_CM       = 18.5;  // widest point, wheels included
-const float AXLE_TO_FRONT_CM     = 15.0;  // wheel-axle centre -> front-most point
-const float AXLE_TO_REAR_CM      = 4.0;   // wheel-axle centre -> rear-most point
-const float SENSOR_AHEAD_CM      = 15.0;  // wheel-axle centre -> front ultrasonic face
-const float SIDE_SENSOR_AHEAD_CM = 11.0;  // wheel-axle centre -> side ultrasonics (forward = +)
+const float AXLE_TO_FRONT_CM     = 10.0;  // wheel-axle centre -> front-most point
+const float AXLE_TO_REAR_CM      = 6.0;   // wheel-axle centre -> rear-most point
+const float SENSOR_AHEAD_CM      = 10.0;  // wheel-axle centre -> front ultrasonic face
+const float SIDE_SENSOR_AHEAD_CM = 6.5;   // wheel-axle centre -> side ultrasonics (forward = +)
 const float TRACK_CM             = 16.0;  // left wheel centre -> right wheel centre
 const float WHEEL_DIA_CM         = 6.5;
 const float GEAR_RATIO           = 34.0;
@@ -44,18 +43,12 @@ const float WALL_HALF_CM         = 0.5;
 const float START_AXLE_FROM_BACK_CM = AXLE_TO_REAR_CM + WALL_HALF_CM;
 
 // ======================= TURNING =======================
-float ARC_RADIUS_CM = 12.5;  // axle path radius in a 90° arc (max 12.5)
-float ARC_TRIM      = 1.00;  // tune with '<' '>' until the arc ends at exactly 90°
-float SPIN_TRIM     = 1.00;  // tune with 'U' until the spin is exactly 180°
-
-// Dead ends: the robot is too long to spin in a corridor, so it reverses out instead
-const float REV_LOOK_CM        = 8.0;   // side sensor depth into a cell when checking it while reversing
-const uint8_t MAX_REVERSE_CELLS = 8;
-const float FRONT_TRUST_CM     = 40.0;  // beyond this the front beam may hit the side walls
+// All turns are in-place spins with the axle at the cell centre
+float SPIN_TRIM = 1.00;                 // tune with '<' '>' 'U' until spins are exact
+const float FRONT_MIN_READ_CM = 5.0;    // front sensor is unreliable closer than this
 
 // ======================= SPEEDS / GAINS =======================
 int BASE_PWM     = 70;
-int ARC_PWM      = 65;
 int SPIN_PWM     = 55;
 int REVERSE_PWM  = 50;
 int DEADBAND_PWM = 35;   // lowest PWM that moves a wheel — measure with 'm'
@@ -77,8 +70,8 @@ const float MAX_ERR_CM = 5.0;
 
 // ======================= ULTRASONIC =======================
 const uint8_t NUM_SENSORS = 3;
-const uint8_t TRIG_PINS[NUM_SENSORS] = {30, 32, 34};
-const uint8_t ECHO_PINS[NUM_SENSORS] = {31, 33, 35};
+const uint8_t TRIG_PINS[NUM_SENSORS] = {40, 36, 38};  // front, left, right
+const uint8_t ECHO_PINS[NUM_SENSORS] = {41, 37, 39};
 const uint8_t S_F = 0, S_L = 1, S_R = 2;
 const uint8_t PING_ORDER[4] = {S_F, S_L, S_F, S_R};
 
@@ -114,7 +107,7 @@ const float FRONT_WINDOW_CM   = 8.0;
 const uint8_t MIN_SAMPLES     = 2;
 const uint8_t CONFIRM_ROUNDS  = 5;     // standing re-check before any turn
 const float FRONT_CORR_MAX_CM = 30.0;
-const float FRONT_STOP_MARGIN_CM = 3.0;  // stop this much before the arc start distance
+const float FRONT_STOP_MARGIN_CM = 3.0;  // stop this much before the next cell's far wall
 const uint8_t FRONT_STOP_HITS = 2;       // consecutive close front readings needed to stop
 const unsigned long STALL_MS  = 400;
 const float STALL_MIN_CM      = 0.5;     // less travel than this in STALL_MS = stuck
@@ -123,25 +116,25 @@ const float STALL_BACK_CM     = 5.0;
 Rule rule = LEFT_HAND;
 
 // ======================= MOTORS (BTS7960 / HW-039) =======================
-const uint8_t L_RPWM = 5, L_LPWM = 6, L_EN = 24;
+const uint8_t L_RPWM = 3, L_LPWM = 2, L_EN = 24;
 const uint8_t R_RPWM = 7, R_LPWM = 8, R_EN = 25;
 const bool LEFT_REVERSED  = false;
 const bool RIGHT_REVERSED = true;
 
 // ======================= ENCODERS =======================
-const uint8_t L_ENC_A = 2,  L_ENC_B = 3;
-const uint8_t R_ENC_A = 18, R_ENC_B = 19;
+const uint8_t L_ENC_A = 9,  L_ENC_B = 10;  // yellow, green
+const uint8_t R_ENC_A = 11, R_ENC_B = 12;
 const bool L_ENC_REVERSED = false;
 const bool R_ENC_REVERSED = true;
 
 float COUNTS_PER_CM;
 
 volatile long lCount = 0, rCount = 0;
-volatile uint8_t lState = 0, rState = 0;
+volatile uint8_t rState = 0, lastPB = 0;
 const int8_t QEM[16] = {0,-1,1,0, 1,0,0,-1, -1,0,0,1, 0,1,-1,0};
 
 // ======================= STATE =======================
-const uint8_t START_BTN = 40;
+const unsigned long START_DELAY_MS = 5000;
 bool running = false;
 bool abortReq = false;
 int cruisePwm = 0;
@@ -169,15 +162,22 @@ uint8_t seen[GRID][GRID];
 uint8_t gx = G0, gy = G0, heading = 0;
 
 // ======================= ENCODER ISRs =======================
-void leftISR() {
-  uint8_t ab = (digitalRead(L_ENC_A) << 1) | digitalRead(L_ENC_B);
-  lState = ((lState << 2) | ab) & 0x0F;
-  lCount += L_ENC_REVERSED ? -QEM[lState] : QEM[lState];
-}
-void rightISR() {
-  uint8_t ab = (digitalRead(R_ENC_A) << 1) | digitalRead(R_ENC_B);
-  rState = ((rState << 2) | ab) & 0x0F;
-  rCount += R_ENC_REVERSED ? -QEM[rState] : QEM[rState];
+// D10/D11/D12 = PB4/PB5/PB6 share one pin-change interrupt; D9 (PH6) has none
+ISR(PCINT0_vect) {
+  uint8_t pb = PINB;
+  uint8_t changed = pb ^ lastPB;
+  lastPB = pb;
+  if (changed & _BV(PB4)) {
+    // left counts on green edges only, x2 to keep the same counts/cm
+    bool a = PINH & _BV(PH6), b = pb & _BV(PB4);
+    int8_t d = (a != b) ? -2 : 2;
+    lCount += L_ENC_REVERSED ? -d : d;
+  }
+  if (changed & (_BV(PB5) | _BV(PB6))) {
+    uint8_t ab = (((pb >> PB5) & 1) << 1) | ((pb >> PB6) & 1);
+    rState = ((rState << 2) | ab) & 0x0F;
+    rCount += R_ENC_REVERSED ? -QEM[rState] : QEM[rState];
+  }
 }
 void getCounts(long &l, long &r) { noInterrupts(); l = lCount; r = rCount; interrupts(); }
 void resetCounts() { noInterrupts(); lCount = 0; rCount = 0; interrupts(); }
@@ -196,20 +196,11 @@ void setMotors(int l, int r) {
 }
 void stopMotors() { setMotors(0, 0); }
 
-// ======================= ABORT (serial 'x' or button) =======================
+// ======================= ABORT (serial 'x') =======================
 void checkAbort() {
   while (Serial.available()) {
     char c = Serial.read();
     if (c == 'x' || c == 'X' || c == ' ') { abortReq = true; running = false; }
-  }
-  if (running && digitalRead(START_BTN) == LOW) {
-    delay(30);
-    if (digitalRead(START_BTN) == LOW) {
-      abortReq = true; running = false;
-      stopMotors();
-      while (digitalRead(START_BTN) == LOW) {}
-      delay(300);
-    }
   }
   if (abortReq) stopMotors();
 }
@@ -294,36 +285,20 @@ float frontCornerRadius() { return sqrt(sq(AXLE_TO_FRONT_CM) + sq(ROBOT_WIDTH_CM
 float rearCornerRadius()  { return sqrt(sq(AXLE_TO_REAR_CM)  + sq(ROBOT_WIDTH_CM / 2.0)); }
 // How far past the cell edge the axle must go before the side sensors see that cell
 float decisionOffset()    { float o = SIDE_LOOK_MIN_CM + 2.0 - SIDE_SENSOR_AHEAD_CM; return (o > 0) ? o : 0; }
-float arcRadius()         { return min(ARC_RADIUS_CM, HALF_CELL - decisionOffset()); }
-float arcFrontTarget(float R) { return HALF_CELL + R - SENSOR_AHEAD_CM - WALL_HALF_CM; }
-float frontStopCm()       { return arcFrontTarget(arcRadius()) + FRONT_STOP_MARGIN_CM; }
-// Where the axle stops inside a cell (from its dead-end side) while reversing: sensors see it, rear stays clear
-float reverseStop()       { return min(SIDE_SENSOR_AHEAD_CM + REV_LOOK_CM, CELL_CM - AXLE_TO_REAR_CM - WALL_HALF_CM - 1.0); }
-float reverseOutRadius()  { return max(reverseStop() - HALF_CELL, 0.0); }
+// Front reading with the axle at the cell centre
+float centreFront()       { return HALF_CELL - SENSOR_AHEAD_CM - WALL_HALF_CM; }
+// Front wall at the far edge of the next cell: stop there and decide
+float frontStopCm()       { return CELL_CM - SENSOR_AHEAD_CM - WALL_HALF_CM + FRONT_STOP_MARGIN_CM; }
 
 void geometryReport() {
-  float hw = ROBOT_WIDTH_CM / 2.0;
-  float R = arcRadius();
-  float outerCorner = sqrt(sq(R + hw) + sq(AXLE_TO_FRONT_CM));
-  float outerClear  = (HALF_CELL + R) - outerCorner - WALL_HALF_CM;
-  float innerClear  = (R - hw) - sqrt(2.0) * (HALF_CELL - R) - WALL_HALF_CM;
-  float spinClear   = HALF_CELL - WALL_HALF_CM - max(frontCornerRadius(), rearCornerRadius());
-  float ratio       = (R - TRACK_CM / 2.0) / (R + TRACK_CM / 2.0);
+  float spinClear = HALF_CELL - WALL_HALF_CM - max(frontCornerRadius(), rearCornerRadius());
 
   Serial.println(F("\n--- Turn geometry (25 cm cell) ---"));
   Serial.print(F("Decision point: axle ")); Serial.print(decisionOffset(), 1);
   Serial.println(F(" cm past the cell edge (side sensors must see the new cell)"));
-  Serial.print(F("Arc radius ")); Serial.print(R, 1);
-  Serial.print(F(" cm -> inner wheel at ")); Serial.print(ratio * 100.0, 0);
-  Serial.println(F("% of outer wheel"));
-  Serial.print(F("Arc: outer corner clearance to far wall = ")); Serial.print(outerClear, 1);
-  Serial.println(outerClear > 0 ? F(" cm  OK") : F(" cm  WARNING: will clip the far wall"));
-  Serial.print(F("Arc: inner clearance to wall corner     = ")); Serial.print(innerClear, 1);
-  Serial.println(innerClear > 0 ? F(" cm  OK") : F(" cm  WARNING: will clip the inner corner"));
-  Serial.print(F("Spin: corner clearance to side walls    = ")); Serial.print(spinClear, 1);
-  Serial.println(spinClear > 0 ? F(" cm  OK") : F(" cm  WARNING: in-place spins (start/recovery) will scrape"));
-  Serial.print(F("Dead end: reverse out, then turn with radius ")); Serial.print(reverseOutRadius(), 1);
-  Serial.println(F(" cm"));
+  Serial.print(F("Spin at cell centre: corner clearance to walls = ")); Serial.print(spinClear, 1);
+  Serial.println(spinClear > 0 ? F(" cm  OK") : F(" cm  WARNING: corners will scrape while spinning"));
+  Serial.print(F("Front reading at cell centre = ")); Serial.print(centreFront(), 1); Serial.println(F(" cm"));
 }
 
 // ======================= MOTION PRIMITIVES =======================
@@ -395,14 +370,6 @@ bool wheelMove(float dL, float dR, int pwm, unsigned long timeoutMs) {
 
 void driveCm(float cm) { wheelMove(cm, cm, BASE_PWM, 4000); }
 
-// dir = -1 left, +1 right
-void arcTurn(int dir, float R) {
-  float outer = (R + TRACK_CM / 2.0) * M_PI / 2.0 * ARC_TRIM;
-  float inner = (R - TRACK_CM / 2.0) * M_PI / 2.0 * ARC_TRIM;
-  if (dir < 0) wheelMove(inner, outer, ARC_PWM, 5000);
-  else         wheelMove(outer, inner, ARC_PWM, 5000);
-}
-
 // deg > 0 = right (clockwise)
 void spinDeg(float deg) {
   float d = M_PI * TRACK_CM * fabs(deg) / 360.0 * SPIN_TRIM;
@@ -426,6 +393,14 @@ void approachFront(float targetCm) {
   }
   stopMotors();
   delay(100);
+}
+
+// Put the axle at the cell centre using the front wall. Too close to read? Stop short, finish by encoders.
+void centreOnFront() {
+  float t = centreFront();
+  if (t >= FRONT_MIN_READ_CM) { approachFront(t); return; }
+  approachFront(FRONT_MIN_READ_CM);
+  if (!abortReq) driveCm(FRONT_MIN_READ_CM - t);
 }
 
 // ======================= DECISION =======================
@@ -483,50 +458,6 @@ void afterManeuver() {
   resumeCruise();
 }
 
-// Dead end: reverse straight back cell by cell until a side opens, then turn into it
-void reverseOut() {
-  float stop = reverseStop();
-  float f = med3(pingNow(S_F), pingNow(S_F), pingNow(S_F));
-  float a = (f < FRONT_TRUST_CM) ? f + SENSOR_AHEAD_CM + WALL_HALF_CM : toBoundary + CELL_CM;  // axle -> dead-end wall
-
-  for (uint8_t k = 1; k <= MAX_REVERSE_CELLS && !abortReq; k++) {
-    float target = k * CELL_CM + stop;
-    if (target > a) wheelMove(a - target, a - target, REVERSE_PWM, 4000);
-    a = target;
-    float frontTarget = target - SENSOR_AHEAD_CM - WALL_HALF_CM;
-    if (frontTarget < FRONT_TRUST_CM) approachFront(frontTarget);
-
-    Walls w = standingWalls(CONFIRM_ROUNDS, 0);
-    if (abortReq) return;
-    if (w.l && w.r) continue;
-
-    // both open: take the side the hand rule would pick after turning around
-    Action t;
-    if (!w.l && !w.r) t = (rule == LEFT_HAND) ? ACT_RIGHT : ACT_LEFT;
-    else t = w.l ? ACT_RIGHT : ACT_LEFT;
-    logDecision(F("[REVERSE-OUT]"), w, t);
-
-    gx = constrain(gx - k * DX[heading], 0, GRID - 1);
-    gy = constrain(gy - k * DY[heading], 0, GRID - 1);
-    float R = reverseOutRadius();
-    arcTurn(t == ACT_LEFT ? -1 : 1, R);
-    toBoundary = HALF_CELL - R;
-    turnHeading(t);
-    return;
-  }
-  Serial.println(F("[REVERSE-OUT] no opening found -> stopping"));
-  abortReq = true; running = false;
-  stopMotors();
-}
-
-// Turn from where the robot stands (start, recovery). 90° spins assume it is near the cell centre.
-void pivot(Action a) {
-  if (a == ACT_UTURN) { reverseOut(); return; }
-  spinDeg(a == ACT_LEFT ? -90 : 90);
-  toBoundary = HALF_CELL;
-  turnHeading(a);
-}
-
 // Stop, recheck all walls standing still, then act. frontWall = the front sensor already saw a wall.
 void confirmAndAct(bool frontWall) {
   Walls w = standingWalls(CONFIRM_ROUNDS, toBoundary);
@@ -541,19 +472,14 @@ void confirmAndAct(bool frontWall) {
     resumeCruise();
     return;
   }
-  if (a == ACT_LEFT || a == ACT_RIGHT) {
-    float R = arcRadius();
-    if (w.f) approachFront(arcFrontTarget(R));
-    else {
-      float pre = (HALF_CELL - R) + toBoundary;
-      if (pre > 0.3) driveCm(pre);
-    }
-    if (!abortReq) arcTurn(a == ACT_LEFT ? -1 : 1, R);
-    toBoundary = HALF_CELL - R;
-    turnHeading(a);
-  } else {
-    pivot(a);
+  if (w.f) centreOnFront();
+  else {
+    float pre = HALF_CELL + toBoundary;
+    if (pre > 0.3) driveCm(pre);
   }
+  if (!abortReq) spinDeg(a == ACT_LEFT ? -90 : a == ACT_RIGHT ? 90 : 180);
+  toBoundary = HALF_CELL;
+  turnHeading(a);
   afterManeuver();
 }
 
@@ -634,18 +560,10 @@ void startRun() {
   memset(seen, 0, sizeof(seen));
   gx = G0; gy = G0; heading = 0;
   seen[G0][G0] = 1;
-  toBoundary = CELL_CM - START_AXLE_FROM_BACK_CM;
-  resetFilters();
-
-  Walls w = standingWalls(CONFIRM_ROUNDS, toBoundary - CELL_CM);
-  if (w.f && !abortReq) {
-    logDecision(F("[START]"), w, decide(w));
-    Serial.println(F("[START] facing a wall - can't turn in the start cell. Place it facing the open side."));
-    abortReq = true; running = false; stopMotors();
-    return;
-  }
+  toBoundary = -START_AXLE_FROM_BACK_CM;   // already inside the start cell
   afterManeuver();
   Serial.println(F("GO"));
+  confirmAndAct(false);
 }
 
 void mazeStep() {
@@ -748,7 +666,7 @@ void deadbandTest() {
 
 void printHelp() {
   Serial.println(F("\ng=go x=stop d=dry-run z=setpoints G=geometry m=deadband e=encoders"));
-  Serial.println(F("F=1 cell  <=arc left  >=arc right  U=180 spin  L/R=hand rule  h=help"));
+  Serial.println(F("F=1 cell  <=spin left  >=spin right  U=180 spin  L/R=hand rule  h=help"));
   Serial.print(F("Rule: ")); Serial.println(rule == LEFT_HAND ? F("LEFT-hand") : F("RIGHT-hand"));
   Serial.print(F("L_SET=")); Serial.print(L_SET, 2);
   Serial.print(F(" R_SET=")); Serial.print(R_SET, 2);
@@ -770,15 +688,11 @@ void setup() {
 
   pinMode(L_ENC_A, INPUT_PULLUP); pinMode(L_ENC_B, INPUT_PULLUP);
   pinMode(R_ENC_A, INPUT_PULLUP); pinMode(R_ENC_B, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(L_ENC_A), leftISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(L_ENC_B), leftISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(R_ENC_A), rightISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(R_ENC_B), rightISR, CHANGE);
-
-  pinMode(START_BTN, INPUT_PULLUP);
+  lastPB = PINB;
+  PCICR |= _BV(PCIE0);
+  PCMSK0 |= _BV(PCINT4) | _BV(PCINT5) | _BV(PCINT6);
 
   COUNTS_PER_CM = (ENC_PPR * 4.0 * GEAR_RATIO) / (M_PI * WHEEL_DIA_CM);
-  if (ARC_RADIUS_CM > HALF_CELL) ARC_RADIUS_CM = HALF_CELL;
   resetFilters();
 
   EEPROM.get(CAL_ADDR, cal);
@@ -793,18 +707,23 @@ void setup() {
   Serial.println(F("\n=== Maze Wall-Follower v3 ==="));
   geometryReport();
   printHelp();
+
+  Serial.println(F("Auto start in 5 s (send any key to cancel)"));
+  unsigned long t0 = millis();
+  uint8_t shown = 0;
+  while (millis() - t0 < START_DELAY_MS) {
+    if (Serial.available()) {
+      while (Serial.available()) Serial.read();
+      Serial.println(F("Auto start cancelled -> command mode"));
+      return;
+    }
+    uint8_t sec = (millis() - t0) / 1000;
+    if (sec >= shown) { Serial.println(START_DELAY_MS / 1000 - sec); shown = sec + 1; }
+  }
+  startRun();
 }
 
 void loop() {
-  if (!running && digitalRead(START_BTN) == LOW) {
-    delay(30);
-    if (digitalRead(START_BTN) == LOW) {
-      while (digitalRead(START_BTN) == LOW) {}
-      delay(500);
-      startRun();
-    }
-  }
-
   if (running) {
     checkAbort();
     if (!running) { Serial.println(F("STOPPED")); return; }
@@ -826,8 +745,8 @@ void loop() {
     case 'e': { long l, r; getCounts(l, r);
                 Serial.print(F("L=")); Serial.print(l); Serial.print(F(" R=")); Serial.println(r); } break;
     case 'F': Serial.println(F("Drive 1 cell")); driveCm(CELL_CM); break;
-    case '<': Serial.println(F("Arc left 90"));  arcTurn(-1, arcRadius()); break;
-    case '>': Serial.println(F("Arc right 90")); arcTurn(1, arcRadius());  break;
+    case '<': Serial.println(F("Spin left 90"));  spinDeg(-90); break;
+    case '>': Serial.println(F("Spin right 90")); spinDeg(90);  break;
     case 'U': Serial.println(F("Spin 180"));     spinDeg(180); break;
     case 'L': rule = LEFT_HAND;  Serial.println(F("LEFT-hand rule"));  break;
     case 'R': rule = RIGHT_HAND; Serial.println(F("RIGHT-hand rule")); break;
