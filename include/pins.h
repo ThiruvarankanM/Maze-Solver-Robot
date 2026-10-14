@@ -20,12 +20,12 @@ constexpr uint8_t MOTOR_RIGHT_LPWM = 8; // reverse
 constexpr uint8_t MOTOR_RIGHT_EN = 25;
 
 // Ultrasonic sensors
-constexpr uint8_t US_FRONT_TRIG = 30;
-constexpr uint8_t US_FRONT_ECHO = 31;
-constexpr uint8_t US_LEFT_TRIG = 32;
-constexpr uint8_t US_LEFT_ECHO = 33;
-constexpr uint8_t US_RIGHT_TRIG = 34;
-constexpr uint8_t US_RIGHT_ECHO = 35;
+constexpr uint8_t US_FRONT_TRIG = 40;
+constexpr uint8_t US_FRONT_ECHO = 41;
+constexpr uint8_t US_LEFT_TRIG = 36;
+constexpr uint8_t US_LEFT_ECHO = 37;
+constexpr uint8_t US_RIGHT_TRIG = 38;
+constexpr uint8_t US_RIGHT_ECHO = 39;
 
 // IR array (left to right)
 constexpr uint8_t IR_PINS[8] = {54, 55, 56, 57, 58, 59, 60, 61}; // A0-A7
